@@ -103,6 +103,7 @@ Resources:
                   - greengrass:CreateComponentVersion
                   - greengrass:DescribeComponent
                   - greengrass:ListComponentVersions
+                  - greengrass:DeleteComponent
                 Resource:
                   - !Sub "arn:${AWS::Partition}:greengrass:${AWS::Region}:${AWS::AccountId}:components:com.deepx.dx-runtime"
                   - !Sub "arn:${AWS::Partition}:greengrass:${AWS::Region}:${AWS::AccountId}:components:com.deepx.dx-runtime:versions:*"
@@ -197,12 +198,39 @@ Resources:
               props = event.get("ResourceProperties", {})
               name = props.get("ComponentName", "unknown")
               version = props.get("ComponentVersion", "unknown")
-              physical_id = "%s:%s" % (name, version)
+              base_id = "%s:%s" % (name, version)
               try:
-                  if event["RequestType"] == "Delete":
-                      _send(event, context, "SUCCESS",
-                            physical_id=event.get("PhysicalResourceId", physical_id))
+                  request_type = event["RequestType"]
+
+                  if request_type == "Delete":
+                      pid = event.get("PhysicalResourceId", base_id)
+                      # Only delete the version THIS stack created (":owned"). A stack that
+                      # skipped a pre-existing version (":shared") must not delete it, or it
+                      # would break a sibling stack that owns it. Component versions are
+                      # account+region global, so ownership can't be inferred from existence.
+                      if pid.endswith(":owned"):
+                          version_arn = "%s:versions:%s" % (_component_arn(props, name), version)
+                          try:
+                              ggv2.delete_component(arn=version_arn)
+                              print("[publish] deleted %s" % version_arn)
+                          except ClientError as error:
+                              # Best-effort: never block stack deletion on component cleanup.
+                              print("[publish] delete skipped for %s: %s" % (version_arn, error))
+                      _send(event, context, "SUCCESS", physical_id=pid)
                       return
+
+                  if request_type == "Update":
+                      # Preserve the create-time ownership marker when the version is
+                      # unchanged. Re-deriving owned/shared here would flip the
+                      # PhysicalResourceId and make CloudFormation delete the live version.
+                      pid = event.get("PhysicalResourceId", base_id)
+                      old_version = pid.rsplit(":", 2)[1] if pid.count(":") >= 2 else None
+                      if old_version == version:
+                          _send(event, context, "SUCCESS",
+                                {"Action": "Unchanged", "ComponentVersion": version}, pid)
+                          return
+                      # Version bumped: fall through and publish the new version. CloudFormation
+                      # then calls Delete on the old PhysicalResourceId (old ":owned" version).
 
                   component_arn = _component_arn(props, name)
                   if _version_exists(component_arn, version):
@@ -210,7 +238,7 @@ Resources:
                       _send(event, context, "SUCCESS",
                             {"Action": "Skipped", "ComponentVersion": version,
                              "Arn": "%s:versions:%s" % (component_arn, version)},
-                            physical_id)
+                            "%s:shared" % base_id)
                       return
 
                   recipe = _render(props["Recipe"], props.get("Substitutions", {}))
@@ -220,10 +248,10 @@ Resources:
                   _wait_deployable(version_arn)
                   _send(event, context, "SUCCESS",
                         {"Action": "Published", "ComponentVersion": version, "Arn": version_arn},
-                        physical_id)
+                        "%s:owned" % base_id)
               except Exception as error:  # noqa: BLE001
                   print("[publish] error: %s" % error)
-                  _send(event, context, "FAILED", {"Message": str(error)}, physical_id)
+                  _send(event, context, "FAILED", {"Message": str(error)}, base_id)
 
   DxRuntimeComponent:
     Type: Custom::ComponentPublish
