@@ -70,7 +70,9 @@ Resources:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: "*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/greengrass/*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/greengrass/*:*"
 
   ComponentPublishFunctionRole:
     Type: AWS::IAM::Role
@@ -101,7 +103,9 @@ Resources:
                   - greengrass:CreateComponentVersion
                   - greengrass:DescribeComponent
                   - greengrass:ListComponentVersions
-                Resource: !Sub "arn:${AWS::Partition}:greengrass:${AWS::Region}:${AWS::AccountId}:components:*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:greengrass:${AWS::Region}:${AWS::AccountId}:components:com.deepx.dx-runtime"
+                  - !Sub "arn:${AWS::Partition}:greengrass:${AWS::Region}:${AWS::AccountId}:components:com.deepx.dx-runtime:versions:*"
 
   ComponentPublishFunction:
     Type: AWS::Lambda::Function
