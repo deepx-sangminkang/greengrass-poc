@@ -1,0 +1,921 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  DX Compiler Automation v2 - AWS Marketplace edition.
+  Upload ONNX model and JSON config file pairs to S3 and compile them to DXNN
+  files using dxcom CLI through a Step Functions workflow with explicit EC2
+  cleanup on success and failure paths.
+
+Metadata:
+  Version: 2.3.0
+  Source: marketplace
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: AWS Marketplace Parameters
+        Parameters:
+          - ImageId
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VpcId
+          - SubnetId
+      - Label:
+          default: Instance Configuration
+        Parameters:
+          - InstanceType
+      - Label:
+          default: Storage Configuration
+        Parameters:
+          - ModelBucketName
+    ParameterLabels:
+      ImageId:
+        default: DX Compiler AMI ID
+      VpcId:
+        default: VPC ID
+      SubnetId:
+        default: Subnet ID
+      InstanceType:
+        default: Compiler instance type
+      ModelBucketName:
+        default: Model and output bucket name
+
+Parameters:
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/marketplace/prod-ei6ws54bjw7to/dx-compiler-automation-2.3.0
+    Description: >-
+      SSM Parameter path for the DX Compiler AMI. Automatically resolves to
+      the correct region-specific AMI ID from AWS Marketplace subscription.
+    ConstraintDescription: Must be a valid SSM Parameter path or AMI ID.
+
+  ModelBucketName:
+    Type: String
+    Description: Globally unique S3 bucket name for ONNX/JSON inputs and DXNN outputs.
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+    ConstraintDescription: >-
+      Must be a valid S3 bucket name 3-63 chars, lowercase letters, numbers,
+      and hyphens only, starting and ending with a letter or number.
+
+  InstanceType:
+    Type: String
+    Default: t3.xlarge
+    AllowedValues:
+      - t3.xlarge
+      - t3a.xlarge
+      - t3.2xlarge
+      - t2.xlarge
+      - c5.xlarge
+      - c5.2xlarge
+      - c5.4xlarge
+      - g4ad.xlarge
+      - g4dn.xlarge
+      - g5.xlarge
+      - g6.xlarge
+    ConstraintDescription: Must be a supported instance type (xlarge or higher).
+    Description: EC2 instance type for compilation. t3.xlarge is recommended.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where compiler instances launch. The selected subnet must belong to this VPC and allow AWS API access.
+    ConstraintDescription: Must be an existing VPC ID in this region.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet for compiler instances. The subnet must have internet access or VPC endpoints for S3, SSM, EC2, Step Functions, and CloudWatch Logs.
+    ConstraintDescription: Must be an existing subnet ID in the selected VPC.
+
+Resources:
+  ModelBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: TriggerLambdaPermission
+    Properties:
+      BucketName: !Ref ModelBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .onnx
+            Function: !GetAtt TriggerFunction.Arn
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .json
+            Function: !GetAtt TriggerFunction.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  TriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt TriggerLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref CompilerStateMachine
+          AMI_ID: !Ref ImageId
+          INSTANCE_TYPE: !Ref InstanceType
+          SUBNET_ID: !Ref SubnetId
+          INSTANCE_PROFILE_ARN: !GetAtt EC2InstanceProfile.Arn
+          SECURITY_GROUP_ID: !Ref CompilerSecurityGroup
+          DOCUMENT_NAME: !Ref CompilerDocument
+      Code:
+        ZipFile: |
+          import json
+          import hashlib
+          import os
+          import re
+          import boto3
+          from urllib.parse import unquote_plus
+
+          stepfunctions = boto3.client('stepfunctions')
+          s3 = boto3.client('s3')
+
+          def safe_fragment(value, max_length=48):
+              safe = re.sub(r'[^A-Za-z0-9_-]+', '-', value).strip('-')
+              if not safe:
+                  safe = 'model'
+              return safe[:max_length]
+
+          def find_pair_key(bucket, key):
+              """Given an uploaded .onnx or .json key, find the counterpart in the same directory."""
+              dirname = os.path.dirname(key)
+              basename = os.path.basename(key)
+              name, ext = os.path.splitext(basename)
+
+              if ext == '.onnx':
+                  target_ext = '.json'
+              elif ext == '.json':
+                  target_ext = '.onnx'
+              else:
+                  return None, None
+
+              prefix = dirname + '/' if dirname else ''
+              resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, Delimiter='/')
+              pair_key = None
+              for obj in resp.get('Contents', []):
+                  obj_basename = os.path.basename(obj['Key'])
+                  if obj_basename.endswith(target_ext) and obj['Key'] != key:
+                      pair_key = obj['Key']
+                      break
+
+              if pair_key is None:
+                  return None, None
+
+              if ext == '.onnx':
+                  return key, pair_key
+              else:
+                  return pair_key, key
+
+          def lambda_handler(event, context):
+              executions = []
+
+              for record in event.get('Records', []):
+                  bucket = record['s3']['bucket']['name']
+                  key = unquote_plus(record['s3']['object']['key'])
+
+                  if not (key.endswith('.onnx') or key.endswith('.json')):
+                      continue
+
+                  onnx_key, config_key = find_pair_key(bucket, key)
+                  if onnx_key is None or config_key is None:
+                      print(f'Pair not found yet for {key}, skipping.')
+                      continue
+
+                  raw_model_name = os.path.splitext(os.path.basename(onnx_key))[0]
+                  model_name = safe_fragment(raw_model_name)
+                  pair_hash = hashlib.sha256(f'{bucket}/{onnx_key}:{config_key}'.encode()).hexdigest()[:12]
+                  execution_name = safe_fragment(f'dx-compile-{model_name}-{pair_hash}', 80)
+
+                  sfn_input = {
+                      'ModelBucket': bucket,
+                      'ModelKey': onnx_key,
+                      'ConfigKey': config_key,
+                      'ModelKeyTag': onnx_key[:240],
+                      'OutputBucket': bucket,
+                      'AmiId': os.environ['AMI_ID'],
+                      'InstanceType': os.environ['INSTANCE_TYPE'],
+                      'SubnetId': os.environ['SUBNET_ID'],
+                      'SecurityGroupIds': [os.environ['SECURITY_GROUP_ID']],
+                      'InstanceProfileArn': os.environ['INSTANCE_PROFILE_ARN'],
+                      'DocumentName': os.environ['DOCUMENT_NAME'],
+                      'InstanceName': safe_fragment(f'dx-compiler-{model_name}', 128)
+                  }
+
+                  try:
+                      response = stepfunctions.start_execution(
+                          stateMachineArn=os.environ['STATE_MACHINE_ARN'],
+                          name=execution_name,
+                          input=json.dumps(sfn_input)
+                      )
+                      executions.append(response['executionArn'])
+                      print(f'Started Step Functions execution: {response["executionArn"]}')
+                  except stepfunctions.exceptions.ExecutionAlreadyExists:
+                      print(f'Execution already exists for {onnx_key}, skipping duplicate.')
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'executions': executions})
+              }
+
+  TriggerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${TriggerFunction}"
+      RetentionInDays: 30
+
+  TriggerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:${AWS::Partition}:s3:::${ModelBucketName}"
+
+  CompilerDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: JSON
+      Content:
+        schemaVersion: '2.2'
+        description: DX Compiler execution document (AWS Marketplace AMI - no installation needed).
+        parameters:
+          ModelBucket:
+            type: String
+            description: S3 bucket containing the ONNX model and JSON config.
+            interpolationType: ENV_VAR
+          ModelKey:
+            type: String
+            description: S3 key of the ONNX model file.
+            interpolationType: ENV_VAR
+          ConfigKey:
+            type: String
+            description: S3 key of the JSON config file.
+            interpolationType: ENV_VAR
+          OutputBucket:
+            type: String
+            description: S3 bucket for compiled DXNN output.
+            interpolationType: ENV_VAR
+        mainSteps:
+          - action: aws:runShellScript
+            name: CompileModel
+            inputs:
+              timeoutSeconds: '3600'
+              runCommand:
+                - '#!/bin/bash'
+                - 'set -Eeuo pipefail'
+                - 'log() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [$1] $2"; }'
+                - ''
+                - '# Environment from SSM parameters'
+                - 'MODEL_BUCKET="${SSM_ModelBucket}"'
+                - 'MODEL_KEY="${SSM_ModelKey}"'
+                - 'CONFIG_KEY="${SSM_ConfigKey}"'
+                - 'OUTPUT_BUCKET="${SSM_OutputBucket}"'
+                - ''
+                - '# Derived variables'
+                - 'RAW_MODEL_NAME=$(basename "$MODEL_KEY" .onnx)'
+                - 'MODEL_NAME=$(printf "%s" "$RAW_MODEL_NAME" | tr -c "A-Za-z0-9._-" "-" | sed "s/^-*//;s/-*$//")'
+                - 'if [ -z "$MODEL_NAME" ]; then MODEL_NAME="model"; fi'
+                - 'MODEL_NAME="${MODEL_NAME:0:80}"'
+                - 'MODEL_DIR=$(dirname "$MODEL_KEY")'
+                - 'WORK_DIR="/tmp/dx-compiler-$MODEL_NAME-$$"'
+                - ''
+                - "trap 'cd /; rm -rf \"$WORK_DIR\"' EXIT"
+                - ''
+                - '# Activate pre-installed dx-com virtual environment'
+                - 'log "INFO" "Starting DX Compiler workflow (AWS Marketplace AMI) for model: $RAW_MODEL_NAME"'
+                - 'log "INFO" "Model source: s3://$MODEL_BUCKET/$MODEL_KEY"'
+                - 'log "INFO" "Config source: s3://$MODEL_BUCKET/$CONFIG_KEY"'
+                - 'source /opt/dx-compiler/venv/bin/activate'
+                - 'dxcom -v'
+                - ''
+                - '# Prepare workspace'
+                - 'mkdir -p "$WORK_DIR"'
+                - 'cd "$WORK_DIR"'
+                - ''
+                - '# Step 1: Download ONNX model from S3 (keep original filename)'
+                - 'log "DOWNLOAD" "Downloading model from s3://$MODEL_BUCKET/$MODEL_KEY"'
+                - 'DOWNLOAD_START=$(date +%s)'
+                - 'ONNX_FILENAME=$(basename "$MODEL_KEY")'
+                - 'aws s3 cp --only-show-errors "s3://$MODEL_BUCKET/$MODEL_KEY" "./$ONNX_FILENAME"'
+                - 'log "DOWNLOAD" "Model download completed: $ONNX_FILENAME"'
+                - ''
+                - '# Step 2: Download JSON config from S3 (keep original filename)'
+                - 'log "DOWNLOAD" "Downloading config from s3://$MODEL_BUCKET/$CONFIG_KEY"'
+                - 'CONFIG_FILENAME=$(basename "$CONFIG_KEY")'
+                - 'aws s3 cp --only-show-errors "s3://$MODEL_BUCKET/$CONFIG_KEY" "./$CONFIG_FILENAME"'
+                - 'log "DOWNLOAD" "Config download completed: $CONFIG_FILENAME"'
+                - ''
+                - '# Step 3: Update dataset_path to use pre-installed calibration dataset'
+                - 'log "CONFIG" "Updating dataset_path in config.json"'
+                - 'sed -i ''s|"dataset_path"[[:space:]]*:[[:space:]]*".*"|"dataset_path": "/opt/dx-compiler/calibration_dataset"|g'' "./$CONFIG_FILENAME"'
+                - 'log "CONFIG" "Config updated to use pre-installed calibration dataset"'
+                - ''
+                - '# Step 4: Run dxcom compiler'
+                - 'log "COMPILE" "Starting compilation with dxcom"'
+                - 'COMPILE_START=$(date +%s)'
+                - 'dxcom -m "./$ONNX_FILENAME" -c "./$CONFIG_FILENAME" -o ./ 2>&1 | tee /tmp/dxcom_output_$$.log; COMPILE_EXIT=${PIPESTATUS[0]}'
+                - 'COMPILE_END=$(date +%s)'
+                - 'COMPILE_DURATION=$((COMPILE_END - COMPILE_START))'
+                - 'log "COMPILE" "dxcom exited with code: $COMPILE_EXIT (duration: ${COMPILE_DURATION}s)"'
+                - 'if [ "$COMPILE_EXIT" -ne 0 ]; then log "ERROR" "Compilation failed with exit code $COMPILE_EXIT"; cat /tmp/dxcom_output_$$.log; rm -f /tmp/dxcom_output_$$.log; exit "$COMPILE_EXIT"; fi'
+                - 'rm -f /tmp/dxcom_output_$$.log'
+                - ''
+                - '# Step 5: Upload .dxnn result to S3'
+                - 'DXNN_FILE=$(find . -maxdepth 1 -name "*.dxnn" -print -quit)'
+                - 'if [ -z "$DXNN_FILE" ]; then log "ERROR" "Compilation failed - no .dxnn output file found"; exit 1; fi'
+                - 'OUTPUT_SIZE=$(stat -c%s "$DXNN_FILE" 2>/dev/null || echo "unknown")'
+                - 'log "COMPILE" "Output file: $DXNN_FILE (size: ${OUTPUT_SIZE} bytes)"'
+                - 'DXNN_BASENAME=$(basename "$DXNN_FILE")'
+                - 'if [ "$MODEL_DIR" = "." ]; then OUTPUT_KEY="$DXNN_BASENAME"; else OUTPUT_KEY="${MODEL_DIR}/$DXNN_BASENAME"; fi'
+                - 'log "UPLOAD" "Uploading result to s3://$OUTPUT_BUCKET/$OUTPUT_KEY"'
+                - 'UPLOAD_START=$(date +%s)'
+                - 'aws s3 cp --only-show-errors --sse AES256 "$DXNN_FILE" "s3://$OUTPUT_BUCKET/$OUTPUT_KEY"'
+                - 'UPLOAD_END=$(date +%s)'
+                - 'UPLOAD_DURATION=$((UPLOAD_END - UPLOAD_START))'
+                - 'DOWNLOAD_END=$(date +%s)'
+                - 'TOTAL_DURATION=$((UPLOAD_END - DOWNLOAD_START))'
+                - 'log "UPLOAD" "Upload completed in ${UPLOAD_DURATION}s"'
+                - 'log "INFO" "Workflow completed successfully (total: ${TOTAL_DURATION}s, compile: ${COMPILE_DURATION}s, upload: ${UPLOAD_DURATION}s)"'
+
+  CompilerExecutionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/dx-compiler/${AWS::StackName}/execution"
+      RetentionInDays: 30
+
+  CompilerStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  CompilerStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt CompilerStateMachineLogGroup.Arn
+        IncludeExecutionData: true
+        Level: ALL
+      DefinitionString: !Sub |
+        {
+          "Comment": "DX Compiler automation workflow (AWS Marketplace) with explicit EC2 cleanup",
+          "TimeoutSeconds": 5400,
+          "StartAt": "StartEC2Instance",
+          "States": {
+            "StartEC2Instance": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:ec2:runInstances",
+              "Parameters": {
+                "ImageId.$": "$.AmiId",
+                "InstanceType.$": "$.InstanceType",
+                "MinCount": 1,
+                "MaxCount": 1,
+                "IamInstanceProfile": {
+                  "Arn.$": "$.InstanceProfileArn"
+                },
+                "NetworkInterfaces": [
+                  {
+                    "DeviceIndex": 0,
+                    "SubnetId.$": "$.SubnetId",
+                    "Groups.$": "$.SecurityGroupIds"
+                  }
+                ],
+                "BlockDeviceMappings": [
+                  {
+                    "DeviceName": "/dev/sda1",
+                    "Ebs": {
+                      "VolumeSize": 30,
+                      "VolumeType": "gp3",
+                      "DeleteOnTermination": true
+                    }
+                  }
+                ],
+                "MetadataOptions": {
+                  "HttpEndpoint": "enabled",
+                  "HttpTokens": "required"
+                },
+                "TagSpecifications": [
+                  {
+                    "ResourceType": "instance",
+                    "Tags": [
+                      {
+                        "Key": "Name",
+                        "Value.$": "$.InstanceName"
+                      },
+                      {
+                        "Key": "Project",
+                        "Value": "DX-Compiler-Automation"
+                      },
+                      {
+                        "Key": "Source",
+                        "Value": "AWS-Marketplace"
+                      },
+                      {
+                        "Key": "ModelFile",
+                        "Value.$": "$.ModelKeyTag"
+                      }
+                    ]
+                  }
+                ]
+              },
+              "ResultPath": "$.EC2Result",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "WorkflowFailedBeforeInstance",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "SaveInstanceId"
+            },
+            "SaveInstanceId": {
+              "Type": "Pass",
+              "Parameters": {
+                "InstanceId.$": "$.EC2Result.Instances[0].InstanceId",
+                "ModelBucket.$": "$.ModelBucket",
+                "ModelKey.$": "$.ModelKey",
+                "ConfigKey.$": "$.ConfigKey",
+                "OutputBucket.$": "$.OutputBucket",
+                "DocumentName.$": "$.DocumentName"
+              },
+              "Next": "WaitForInstanceReady"
+            },
+            "WaitForInstanceReady": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Comment": "Wait for EC2 instance boot and SSM registration",
+              "Next": "RunCompilationCommand"
+            },
+            "RunCompilationCommand": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+              "Parameters": {
+                "DocumentName.$": "$.DocumentName",
+                "InstanceIds.$": "States.Array($.InstanceId)",
+                "TimeoutSeconds": 600,
+                "Parameters": {
+                  "ModelBucket.$": "States.Array($.ModelBucket)",
+                  "ModelKey.$": "States.Array($.ModelKey)",
+                  "ConfigKey.$": "States.Array($.ConfigKey)",
+                  "OutputBucket.$": "States.Array($.OutputBucket)"
+                },
+                "CloudWatchOutputConfig": {
+                  "CloudWatchLogGroupName": "${CompilerExecutionLogGroup}",
+                  "CloudWatchOutputEnabled": true
+                }
+              },
+              "ResultPath": "$.CommandResult",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 8,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "TerminateInstanceAfterFailure",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "WaitForCompletion"
+            },
+            "WaitForCompletion": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Comment": "Wait before checking compilation command status",
+              "Next": "CheckCommandStatus"
+            },
+            "CheckCommandStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+              "Parameters": {
+                "CommandId.$": "$.CommandResult.Command.CommandId",
+                "InstanceId.$": "$.InstanceId"
+              },
+              "ResultPath": "$.CommandInvocation",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 15,
+                  "MaxAttempts": 20,
+                  "BackoffRate": 1.2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "TerminateInstanceAfterFailure",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "EvaluateCommandResult"
+            },
+            "EvaluateCommandResult": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.CommandInvocation.Status",
+                  "StringEquals": "Success",
+                  "Next": "TerminateInstanceAfterSuccess"
+                },
+                {
+                  "Or": [
+                    {
+                      "Variable": "$.CommandInvocation.Status",
+                      "StringEquals": "Pending"
+                    },
+                    {
+                      "Variable": "$.CommandInvocation.Status",
+                      "StringEquals": "InProgress"
+                    },
+                    {
+                      "Variable": "$.CommandInvocation.Status",
+                      "StringEquals": "Delayed"
+                    }
+                  ],
+                  "Next": "WaitForCompletion"
+                },
+                {
+                  "Or": [
+                    {
+                      "Variable": "$.CommandInvocation.Status",
+                      "StringEquals": "Failed"
+                    },
+                    {
+                      "Variable": "$.CommandInvocation.Status",
+                      "StringEquals": "Cancelled"
+                    },
+                    {
+                      "Variable": "$.CommandInvocation.Status",
+                      "StringEquals": "Cancelling"
+                    },
+                    {
+                      "Variable": "$.CommandInvocation.Status",
+                      "StringEquals": "TimedOut"
+                    }
+                  ],
+                  "Next": "TerminateInstanceAfterFailure"
+                }
+              ],
+              "Default": "TerminateInstanceAfterFailure"
+            },
+            "TerminateInstanceAfterSuccess": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:ec2:terminateInstances",
+              "Parameters": {
+                "InstanceIds.$": "States.Array($.InstanceId)"
+              },
+              "ResultPath": "$.TerminateResult",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "WorkflowFailed",
+                  "ResultPath": "$.terminateError"
+                }
+              ],
+              "Next": "WorkflowComplete"
+            },
+            "TerminateInstanceAfterFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:ec2:terminateInstances",
+              "Parameters": {
+                "InstanceIds.$": "States.Array($.InstanceId)"
+              },
+              "ResultPath": "$.TerminateResult",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "WorkflowFailed",
+                  "ResultPath": "$.terminateError"
+                }
+              ],
+              "Next": "WorkflowFailed"
+            },
+            "WorkflowComplete": {
+              "Type": "Pass",
+              "Result": {
+                "Status": "SUCCESS",
+                "Message": "DX Compiler workflow completed successfully. The compiler instance was terminated."
+              },
+              "End": true
+            },
+            "WorkflowFailedBeforeInstance": {
+              "Type": "Fail",
+              "Cause": "DX Compiler workflow failed before an EC2 instance ID was available."
+            },
+            "WorkflowFailed": {
+              "Type": "Fail",
+              "Cause": "DX Compiler workflow failed. Cleanup was attempted for the compiler instance."
+            }
+          }
+        }
+
+  CompilerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for DX Compiler instances - outbound only.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for AWS API calls (S3, SSM, CloudWatch Logs).
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-compiler-sg"
+        - Key: Purpose
+          Value: DX-Compiler-Outbound-Only
+
+  TriggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: StepFunctionsExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref CompilerStateMachine
+        - PolicyName: S3PairCheck
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ModelBucketName}"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ModelBucketName}/*"
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EC2Management
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DescribeForScheduler
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeImages
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                Resource: '*'
+              - Sid: RunCompilerInstance
+                Effect: Allow
+                Action:
+                  - ec2:RunInstances
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:key-pair/*"
+              - Sid: TagOnRunInstances
+                Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction: RunInstances
+              - Sid: TerminateOwnCompilerInstances
+                Effect: Allow
+                Action:
+                  - ec2:TerminateInstances
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/Project: DX-Compiler-Automation
+              - Sid: PassInstanceRoleToEC2
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt EC2InstanceRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ec2.amazonaws.com
+        - PolicyName: SSMExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SendCompilerCommand
+                Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${CompilerDocument}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+              - Sid: ReadCommandInvocations
+                Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:DescribeInstanceInformation
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+        - PolicyName: StepFunctionsLogging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ManageLogDelivery
+                Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              - Sid: WriteToLogGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt CompilerStateMachineLogGroup.Arn
+                  - !Sub "${CompilerStateMachineLogGroup.Arn}:*"
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: S3ModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadOnnxModels
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ModelBucketName}/*.onnx"
+                  - !Sub "arn:${AWS::Partition}:s3:::${ModelBucketName}/*.json"
+              - Sid: WriteCompiledDxnnOutputs
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ModelBucketName}/*.dxnn"
+                Condition:
+                  StringEquals:
+                    s3:x-amz-server-side-encryption: AES256
+              - Sid: ListModelBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ModelBucketName}"
+        - PolicyName: CloudWatchLogsWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteCompilerExecutionLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !GetAtt CompilerExecutionLogGroup.Arn
+                  - !Sub "${CompilerExecutionLogGroup.Arn}:*"
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+Outputs:
+  ModelBucketName:
+    Description: S3 bucket for ONNX/JSON inputs and DXNN outputs.
+    Value: !Ref ModelBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ModelBucket"
+
+  StateMachineArn:
+    Description: Step Functions state machine ARN for monitoring executions.
+    Value: !Ref CompilerStateMachine
+    Export:
+      Name: !Sub "${AWS::StackName}-StateMachine"
+
+  WorkflowInstructions:
+    Description: Instructions for using the DX Compiler automation.
+    Value: !Sub |
+      DX COMPILER AUTOMATION - AWS MARKETPLACE EDITION (v2.3.0)
+
+      USAGE:
+      1. Upload .onnx model and .json config file pairs to the same directory in: s3://${ModelBucket}/
+         (e.g., models/resnet.onnx and models/resnet.json)
+      2. When both files are present, Step Functions starts a compiler instance.
+      3. The instance uses pre-installed dxcom to compile immediately (no installation needed).
+      4. Compiled .dxnn files are uploaded to the same S3 directory as the source files.
+      5. The compiler EC2 instance is terminated by Step Functions on success and failure paths.
+      6. Monitor executions in Step Functions: ${CompilerStateMachine}
+      7. View compiler execution logs in CloudWatch: ${CompilerExecutionLogGroup}
+
+  CompilerExecutionLogGroupName:
+    Description: CloudWatch Logs group for DX Compiler execution output.
+    Value: !Ref CompilerExecutionLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-CompilerExecutionLogGroup"

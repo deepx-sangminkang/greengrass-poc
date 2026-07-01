@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DX Runtime Greengrass Web POC</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="container">
+    <h1>DX Runtime Greengrass Web POC</h1>
+    <p class="subtitle">Walks through everything from IoT Core registration to Greengrass component deployment.</p>
+
+    <div id="context-bar" class="context-bar" hidden>
+      <span id="ctx-stack">Stack: -</span>
+      <span id="ctx-thing-group">Thing Group: -</span>
+    </div>
+
+    <!-- ============ VIEW: HOME (CloudFormation) ============ -->
+    <section class="view" id="view-home">
+      <section class="card" id="setup-step">
+        <h2>1. AWS CloudFormation Setup</h2>
+        <p>Create a new stack by specifying a stack name, or select an existing stack to use as the target. Once a stack is selected, you can proceed to the next step.</p>
+        <div class="field-row">
+          <input id="stack-name" placeholder="Stack name" value="DXGreengrassStack">
+          <select id="stack-list" onchange="if (this.value) selectStack()">
+            <option value="">Select existing stack...</option>
+          </select>
+        </div>
+        <div class="actions">
+          <button onclick="loadStacks()">List existing stacks</button>
+          <button onclick="selectStack()">Use selected stack</button>
+          <button onclick="loadSetupStatus()">Check status</button>
+          <button onclick="deploySetupStack()">Create/Update stack</button>
+        </div>
+        <pre id="setup-output"></pre>
+        <div class="actions next-actions">
+          <button id="home-next-btn" class="primary-next" onclick="goToDevices()" disabled>Next → Core Device</button>
+        </div>
+      </section>
+    </section>
+
+    <!-- ============ VIEW: DEVICES ============ -->
+    <section class="view" id="view-devices" hidden>
+      <div class="actions">
+        <button class="ghost" onclick="goHome()">← CloudFormation</button>
+        <button onclick="goToRegister()">＋ Register Core device</button>
+        <button class="ghost" onclick="refreshDeviceList()">Refresh list</button>
+      </div>
+
+      <section class="card">
+        <h2>2. Core Device</h2>
+        <p>Thing Group created in this stack: <strong id="devices-thing-group-name">-</strong></p>
+        <div class="field-row hidden-controls">
+          <select id="component-thing-group"></select>
+          <button onclick="loadThingGroups()">Refresh Thing Group</button>
+          <button onclick="loadDeviceComponents()">Check install status for all devices</button>
+        </div>
+        <div id="device-list" class="core-device-list"></div>
+        <div id="device-components"></div>
+        <pre id="component-output"></pre>
+      </section>
+
+      <div id="device-tabbar" class="tabbar"></div>
+
+      <section class="card" id="device-panel" hidden>
+        <h2 id="device-panel-title">Core Device</h2>
+
+        <div class="device-section">
+          <h3>Component install status</h3>
+          <div class="actions">
+            <button onclick="loadActiveDeviceComponents()">Refresh install status</button>
+          </div>
+          <div id="active-device-components"></div>
+        </div>
+      </section>
+    </section>
+
+    <!-- ============ VIEW: REGISTER (Core device install) ============ -->
+    <section class="view" id="view-register" hidden>
+      <div class="actions">
+        <button class="ghost" onclick="goToDevices()">← Device list</button>
+      </div>
+      <section class="card" id="device-step">
+        <h2>Register Core device</h2>
+        <p>The Thing group and token exchange role use the outputs of the selected stack.</p>
+        <div class="field-row">
+          <input id="thing-name" placeholder="Thing name" value="DeepxCore01">
+        </div>
+        <div class="actions">
+          <button onclick="generateInstallScript()">Generate install script</button>
+          <button onclick="loadCoreDevices()">List existing Cores</button>
+        </div>
+        <details open>
+          <summary>Manual installation guide</summary>
+          <ol>
+            <li>Enter the Thing name. The Thing group and token exchange role use the stack outputs.</li>
+            <li>Click "Generate install script" to create the Greengrass Core install script.</li>
+            <li>Copy the generated script content and run it on the core device terminal.</li>
+            <li>Once installation completes, click "List existing Cores" to verify the registration status.</li>
+          </ol>
+          <details open>
+            <summary>Shell commands to enter directly on the core device</summary>
+            <p>You can paste the commands below directly into the core device terminal and run them. Replace the <code>&lt;...&gt;</code> parts with actual values (or click "Generate install script" with the inputs above to produce a filled-in script).</p>
+            <button type="button" onclick="copyManualCommands()">Copy commands</button>
+            <pre><code id="manual-install-commands"># 0. Configure AWS credentials (required before installation)
+export AWS_ACCESS_KEY_ID=&lt;access-key&gt;
+export AWS_SECRET_ACCESS_KEY=&lt;secret-key&gt;
+export AWS_SESSION_TOKEN=&lt;session-token&gt;   # if using temporary credentials
+# or: aws configure
+
+# 1. Check whether Java is installed (install if missing)
+if ! command -v java &gt;/dev/null 2&gt;&amp;1; then
+  echo "Java is required before installing AWS IoT Greengrass Core."
+  exit 1
+fi
+
+# 2. Download &amp; unzip Greengrass Nucleus
+curl -s https://d2s8p88vqu9w66.cloudfront.net/releases/greengrass-nucleus-latest.zip &gt; greengrass-nucleus-latest.zip
+rm -rf GreengrassInstaller
+unzip -q greengrass-nucleus-latest.zip -d GreengrassInstaller
+
+# 3. Install Greengrass Core (auto-provisioning + system service registration)
+sudo -E java -Droot="/greengrass/v2" -Dlog.store=FILE \
+  -jar ./GreengrassInstaller/lib/Greengrass.jar \
+  --aws-region &lt;region&gt; \
+  --thing-name &lt;thing_name&gt; \
+  --thing-group-name &lt;thing_group_name&gt; \
+  --tes-role-name &lt;token_exchange_role_name&gt; \
+  --component-default-user 'ggc_user:ggc_group' \
+  --provision true \
+  --setup-system-service true \
+  --deploy-dev-tools true
+
+# 4. Check service status
+sudo systemctl status greengrass.service --no-pager</code></pre>
+          </details>
+          <details>
+            <summary>Detailed guide</summary>
+            <p>The core device requires <strong>Java (JDK 8 or higher)</strong> and <strong>sudo privileges</strong>. The script first checks whether Java is installed with <code>command -v java</code>, and aborts immediately if it is not installed (it does not auto-install Java).</p>
+            <p>If Java is missing, install it on the device first.</p>
+            <pre><code># Debian/Ubuntu
+sudo apt-get update &amp;&amp; sudo apt-get install -y default-jdk
+
+# Amazon Linux/RHEL
+sudo yum install -y java-11-amazon-corretto-headless</code></pre>
+            <p>The Greengrass installation steps are as follows.</p>
+            <ol>
+              <li>Download the Greengrass Nucleus zip and unzip it.</li>
+              <li>Run <code>sudo -E java -jar Greengrass.jar ...</code> with the <code>--provision true</code> option to automatically handle IoT Thing creation, certificate/key, policy attachment, and Greengrass Core registration.</li>
+              <li>Register the <code>greengrass.service</code> systemd service with <code>--setup-system-service true</code>, and deploy development tools with <code>--deploy-dev-tools true</code>.</li>
+              <li>The installation path is <code>/greengrass/v2</code>.</li>
+            </ol>
+            <p class="warn"><strong>⚠ Configure AWS credentials in advance.</strong> The install script does not include static keys such as AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY. The <code>--provision true</code> provisioning uses the credentials from the <em>core device-side environment variables</em> passed through <code>sudo -E</code>, so you must configure the credentials on the device before running the installation.</p>
+            <pre><code># Run on the core device before installation
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...   # if using temporary credentials
+# or: aws configure</code></pre>
+            <p>Once installation completes, the runtime components use temporary credentials issued by the Token Exchange Service (TES) instead of static keys.</p>
+          </details>
+        </details>
+        <div id="core-device-list" class="core-device-list"></div>
+        <p id="selected-core-output" class="selected-core">No core device selected.</p>
+        <details>
+          <summary>Advanced: Run installation via SSH</summary>
+          <p class="warn">SSH installation sends the AWS credentials used by this server (backend) to the core device for use in <code>--provision true</code> provisioning. There is no need to configure credentials separately on the device. (Credentials are passed only via <code>sudo bash</code> standard input and are not exposed in the process list.)</p>
+          <div class="field-row">
+            <input id="ssh-host" placeholder="SSH host">
+            <input id="ssh-user" placeholder="SSH username">
+            <input id="ssh-port" placeholder="SSH port (default 22)" type="number" min="1" max="65535">
+            <input id="ssh-password" placeholder="SSH password" type="password">
+            <input id="ssh-key" placeholder="Private key path">
+          </div>
+          <button onclick="runSshInstall()">Run SSH installation</button>
+        </details>
+        <pre id="device-output"></pre>
+      </section>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

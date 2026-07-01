@@ -1,0 +1,169 @@
+name: DXCompilerSetup
+description: Pre-installs DX Compiler dependencies (Python 3.11, dx-com, system libraries, AWS CLI) for the DX Compiler AMI.
+schemaVersion: 1.0
+
+parameters:
+  - DxComVersion:
+      type: string
+      default: "latest"
+      description: Version of dx-com package to install. Use "latest" or a specific version like "1.2.3".
+
+phases:
+  - name: build
+    steps:
+      - name: SystemUpdate
+        action: ExecuteBash
+        inputs:
+          commands:
+            - echo "[INFO] Updating system packages"
+            - sudo apt-get update -qq
+            - sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
+
+      - name: InstallSystemDependencies
+        action: ExecuteBash
+        inputs:
+          commands:
+            - echo "[INFO] Installing system dependencies"
+            - sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
+                curl
+                unzip
+                make
+                libgl1-mesa-glx
+                libglib2.0-0
+                python3.11
+                python3.11-dev
+                python3.11-venv
+            - python3.11 --version
+
+      - name: InstallSSMAgent
+        action: ExecuteBash
+        inputs:
+          commands:
+            - echo "[INFO] Ensuring SSM Agent is installed and running"
+            - |
+              if ! systemctl list-unit-files | grep -q amazon-ssm-agent; then
+                curl -fsSL "https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/debian_amd64/amazon-ssm-agent.deb" -o /tmp/amazon-ssm-agent.deb
+                sudo dpkg -i /tmp/amazon-ssm-agent.deb
+                rm -f /tmp/amazon-ssm-agent.deb
+              fi
+            - sudo systemctl enable amazon-ssm-agent
+            - sudo systemctl start amazon-ssm-agent
+            - echo "[INFO] SSM Agent is active"
+
+      - name: InstallAWSCLI
+        action: ExecuteBash
+        inputs:
+          commands:
+            - echo "[INFO] Installing AWS CLI v2"
+            - if command -v aws &>/dev/null; then echo "AWS CLI already installed"; aws --version; exit 0; fi
+            - curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+            - unzip -q /tmp/awscliv2.zip -d /tmp
+            - sudo /tmp/aws/install
+            - rm -rf /tmp/awscliv2.zip /tmp/aws
+            - aws --version
+
+      - name: CreateDxComVenv
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              echo "[INFO] Creating Python virtual environment for dx-com"
+              python3.11 -m venv /opt/dx-compiler/venv
+              source /opt/dx-compiler/venv/bin/activate
+              pip install --upgrade pip
+              if [ "{{ DxComVersion }}" = "latest" ]; then
+                pip install dx-com
+              else
+                pip install "dx-com=={{ DxComVersion }}"
+              fi
+              dxcom -v
+              deactivate
+              echo "[INFO] dx-com installed at /opt/dx-compiler/venv"
+
+      - name: DownloadCalibrationDataset
+        action: ExecuteBash
+        inputs:
+          commands:
+            - echo "[INFO] Pre-downloading calibration dataset"
+            - mkdir -p /opt/dx-compiler/calibration_dataset
+            - curl -fsSL "https://sdk.deepx.ai/dataset/calibration_dataset.tar.gz" -o /tmp/calibration_dataset.tar.gz
+            - tar -xzf /tmp/calibration_dataset.tar.gz -C /opt/dx-compiler/calibration_dataset
+            - rm -f /tmp/calibration_dataset.tar.gz
+            - echo "[INFO] Calibration dataset cached at /opt/dx-compiler/calibration_dataset"
+
+      - name: CreateCompilerWrapper
+        action: ExecuteBash
+        inputs:
+          commands:
+            - echo "[INFO] Creating dxcom wrapper script"
+            - |
+              cat > /usr/local/bin/dx-compile <<'EOF'
+              #!/bin/bash
+              set -Eeuo pipefail
+              source /opt/dx-compiler/venv/bin/activate
+              exec dxcom "$@"
+              EOF
+            - chmod +x /usr/local/bin/dx-compile
+            - echo "[INFO] Wrapper script created at /usr/local/bin/dx-compile"
+
+      - name: Cleanup
+        action: ExecuteBash
+        inputs:
+          commands:
+            - echo "[INFO] Cleaning up"
+            - sudo apt-get clean
+            - sudo rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+            - echo "[INFO] Build phase complete"
+
+  - name: validate
+    steps:
+      - name: ValidatePython
+        action: ExecuteBash
+        inputs:
+          commands:
+            - python3.11 --version
+            - /opt/dx-compiler/venv/bin/python --version
+
+      - name: ValidateDxCom
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              source /opt/dx-compiler/venv/bin/activate
+              dxcom -v
+              dx-compile -v
+
+      - name: ValidateAWSCLI
+        action: ExecuteBash
+        inputs:
+          commands:
+            - aws --version
+
+      - name: ValidateCalibrationDataset
+        action: ExecuteBash
+        inputs:
+          commands:
+            - test -d /opt/dx-compiler/calibration_dataset
+            - echo "[INFO] Calibration dataset directory exists"
+            - ls /opt/dx-compiler/calibration_dataset | head -5
+
+      - name: ValidateDiskSpace
+        action: ExecuteBash
+        inputs:
+          commands:
+            - df -h /
+            - echo "[INFO] All validations passed"
+
+  - name: test
+    steps:
+      - name: TestDxComImport
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              source /opt/dx-compiler/venv/bin/activate
+              python -c "import dx_com; print(dx_com.__version__)"
+              echo "[INFO] dx-com import test passed"

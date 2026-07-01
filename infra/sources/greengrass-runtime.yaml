@@ -1,0 +1,378 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  DX Runtime AWS IoT Greengrass infrastructure. Provisions the AWS IoT thing
+  group, the Greengrass core-device token exchange role, and an idempotent
+  publisher for the com.deepx.dx-runtime component, then creates a Greengrass
+  deployment that installs the DEEPX NPU runtime (driver, firmware, dx_rt, and
+  the dx_stream GStreamer runtime) on the core devices in the thing group.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: dx-runtime-greengrass-web
+    Description: Logical project name surfaced through stack outputs.
+  ThingGroupName:
+    Type: String
+    Default: ""
+    Description: >-
+      AWS IoT thing group that Greengrass core devices join. Leave empty to
+      derive a stack-unique name (<stack-name>-cores) so multiple stacks can
+      coexist in the same account.
+  DxRuntimeComponentVersion:
+    Type: String
+    Default: "1.0.7"
+    Description: Existing published version of the com.deepx.dx-runtime component to deploy.
+  DxRuntimeGitRef:
+    Type: String
+    Default: "v2.3.3"
+    Description: >-
+      Immutable git tag/commit of DEEPX-AI/dx-runtime to clone at deploy time.
+  CliComponentVersion:
+    Type: String
+    Default: "2.17.0"
+    Description: >-
+      Concrete version of the AWS-managed aws.greengrass.Cli component to deploy.
+      The Cli version tracks the Greengrass nucleus version, so set this to match
+      the nucleus running on the core devices (nucleus 2.17.x -> Cli 2.17.0).
+      Enables the greengrass-cli local development tool on each core device.
+
+Conditions:
+  HasThingGroupName: !Not [!Equals [!Ref ThingGroupName, ""]]
+
+Resources:
+  GreengrassThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !If
+        - HasThingGroupName
+        - !Ref ThingGroupName
+        - !Sub "${AWS::StackName}-cores"
+
+  GreengrassTokenExchangeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Token exchange role for DX Greengrass core devices
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: credentials.iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GreengrassTokenExchangePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: GreengrassLogging
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  ComponentPublishFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Execution role for the idempotent Greengrass component publisher Lambda.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ComponentPublishPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ComponentPublishLogging
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Sid: ComponentPublish
+                Effect: Allow
+                Action:
+                  - greengrass:CreateComponentVersion
+                  - greengrass:DescribeComponent
+                  - greengrass:ListComponentVersions
+                Resource: !Sub "arn:${AWS::Partition}:greengrass:${AWS::Region}:${AWS::AccountId}:components:*"
+
+  ComponentPublishFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: >-
+        Idempotently publishes a Greengrass private component version from an inline
+        recipe. Skips creation when the requested version already exists.
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt ComponentPublishFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import urllib.request
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          ggv2 = boto3.client("greengrassv2")
+
+          DEPLOYABLE_TIMEOUT = 180
+          POLL_INTERVAL = 3
+
+
+          def _send(event, context, status, data=None, physical_id=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": "See CloudWatch Logs: %s" % context.log_stream_name,
+                  "PhysicalResourceId": physical_id or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {},
+              }).encode("utf-8")
+              request = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=body,
+                  method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))},
+              )
+              urllib.request.urlopen(request)
+
+
+          def _render(recipe, subs):
+              for key, value in subs.items():
+                  recipe = recipe.replace("{{ %s }}" % key, str(value))
+              return recipe
+
+
+          def _component_arn(props, name):
+              return "arn:%s:greengrass:%s:%s:components:%s" % (
+                  props.get("Partition", "aws"),
+                  props["Region"],
+                  props["AccountId"],
+                  name,
+              )
+
+
+          def _version_exists(component_arn, version):
+              try:
+                  paginator = ggv2.get_paginator("list_component_versions")
+                  for page in paginator.paginate(arn=component_arn):
+                      for item in page.get("componentVersions", []):
+                          if item.get("componentVersion") == version:
+                              return True
+              except ClientError as error:
+                  if error.response["Error"]["Code"] == "ResourceNotFoundException":
+                      return False
+                  raise
+              return False
+
+
+          def _wait_deployable(version_arn):
+              deadline = time.time() + DEPLOYABLE_TIMEOUT
+              while time.time() < deadline:
+                  status = ggv2.describe_component(arn=version_arn)["status"]
+                  state = status.get("componentState")
+                  if state == "DEPLOYABLE":
+                      return
+                  if state == "FAILED":
+                      raise RuntimeError("Component publish failed: %s" % status.get("message"))
+                  time.sleep(POLL_INTERVAL)
+              raise TimeoutError("Component %s did not become DEPLOYABLE in time" % version_arn)
+
+
+          def handler(event, context):
+              props = event.get("ResourceProperties", {})
+              name = props.get("ComponentName", "unknown")
+              version = props.get("ComponentVersion", "unknown")
+              physical_id = "%s:%s" % (name, version)
+              try:
+                  if event["RequestType"] == "Delete":
+                      _send(event, context, "SUCCESS",
+                            physical_id=event.get("PhysicalResourceId", physical_id))
+                      return
+
+                  component_arn = _component_arn(props, name)
+                  if _version_exists(component_arn, version):
+                      print("[publish] %s:%s already exists, skipping" % (name, version))
+                      _send(event, context, "SUCCESS",
+                            {"Action": "Skipped", "ComponentVersion": version,
+                             "Arn": "%s:versions:%s" % (component_arn, version)},
+                            physical_id)
+                      return
+
+                  recipe = _render(props["Recipe"], props.get("Substitutions", {}))
+                  response = ggv2.create_component_version(inlineRecipe=recipe.encode("utf-8"))
+                  version_arn = response["arn"]
+                  print("[publish] created %s, waiting for DEPLOYABLE" % version_arn)
+                  _wait_deployable(version_arn)
+                  _send(event, context, "SUCCESS",
+                        {"Action": "Published", "ComponentVersion": version, "Arn": version_arn},
+                        physical_id)
+              except Exception as error:  # noqa: BLE001
+                  print("[publish] error: %s" % error)
+                  _send(event, context, "FAILED", {"Message": str(error)}, physical_id)
+
+  DxRuntimeComponent:
+    Type: Custom::ComponentPublish
+    Properties:
+      ServiceToken: !GetAtt ComponentPublishFunction.Arn
+      ComponentName: "com.deepx.dx-runtime"
+      ComponentVersion: !Ref DxRuntimeComponentVersion
+      Partition: !Ref "AWS::Partition"
+      Region: !Ref "AWS::Region"
+      AccountId: !Ref "AWS::AccountId"
+      Substitutions:
+        version: !Ref DxRuntimeComponentVersion
+        git_ref: !Ref DxRuntimeGitRef
+      Recipe: |
+        RecipeFormatVersion: "2020-01-25"
+        ComponentName: "com.deepx.dx-runtime"
+        ComponentVersion: "{{ version }}"
+        ComponentType: "aws.greengrass.generic"
+        ComponentDescription: "DEEPX NPU runtime installation component (driver, firmware, dx_rt, dx_stream runtime)"
+        ComponentPublisher: "DEEPX"
+        Manifests:
+          - Platform:
+              os: "linux"
+            Lifecycle:
+              Install:
+                Timeout: 1800
+                Script: |
+                  echo "Starting DX-Runtime Step-by-Step Installation..."
+
+                  # Environment required for dxrt-cli / gst-inspect-1.0 (dxstream)
+                  # to resolve their binaries, libraries, and GStreamer plugins.
+                  export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
+
+                  # Resolve the multiarch triplet so plugin/library paths work on
+                  # both x86_64 and aarch64 (Raspberry Pi) hosts instead of being
+                  # hardcoded to x86_64-linux-gnu.
+                  GST_ARCH_TRIPLET="$(gcc -dumpmachine 2>/dev/null || true)"
+                  if [ -z "$GST_ARCH_TRIPLET" ]; then
+                    case "$(uname -m)" in
+                      x86_64) GST_ARCH_TRIPLET="x86_64-linux-gnu" ;;
+                      aarch64|arm64) GST_ARCH_TRIPLET="aarch64-linux-gnu" ;;
+                      armv7l|armv6l) GST_ARCH_TRIPLET="arm-linux-gnueabihf" ;;
+                      *) GST_ARCH_TRIPLET="$(uname -m)-linux-gnu" ;;
+                    esac
+                  fi
+                  GST_PLUGIN_DIR="/usr/local/lib/${GST_ARCH_TRIPLET}/gstreamer-1.0"
+
+                  export GST_PLUGIN_PATH="${GST_PLUGIN_DIR}:$GST_PLUGIN_PATH"
+                  export LD_LIBRARY_PATH="${GST_PLUGIN_DIR}:/usr/local/share/gstdxstream/lib:$LD_LIBRARY_PATH"
+                  export PATH="/usr/local/share/gstdxstream/bin:/usr/local/bin:$PATH"
+
+                  # Detect installed versions up front so we can skip the git clone
+                  # and the whole install when every target is already current.
+                  # dxrt-cli / gst-inspect-1.0 may be absent on a fresh host, in
+                  # which case every target is installed.
+                  DXRT_CLI="/usr/local/bin/dxrt-cli"
+                  # These payload versions must be validated against DxRuntimeGitRef on a real device.
+                  EXPECTED_RT_DRIVER_VERSION="v2.4.1"
+                  EXPECTED_DXRT_VERSION="v3.3.2"
+                  EXPECTED_FW_VERSION="v2.5.6"
+                  EXPECTED_DXSTREAM_VERSION="3.0.1"
+
+                  DXRT_STATUS=""
+                  if [ -x "$DXRT_CLI" ]; then
+                    DXRT_STATUS="$("$DXRT_CLI" -s 2>/dev/null || true)"
+                  fi
+
+                  CURRENT_DXRT_VERSION="$(printf '%s\n' "$DXRT_STATUS" | grep -oE 'DXRT v[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | awk '{print $2}')"
+                  CURRENT_RT_DRIVER_VERSION="$(printf '%s\n' "$DXRT_STATUS" | grep -E 'RT Driver version' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+                  CURRENT_FW_VERSION="$(printf '%s\n' "$DXRT_STATUS" | grep -E 'FW version' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+
+                  CURRENT_DXSTREAM_VERSION=""
+                  if command -v gst-inspect-1.0 >/dev/null 2>&1; then
+                    CURRENT_DXSTREAM_VERSION="$(gst-inspect-1.0 dxstream 2>/dev/null | grep -E '^[[:space:]]*Version' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+                  fi
+
+
+                  NEED_DRIVER=1; [ "$CURRENT_RT_DRIVER_VERSION" = "$EXPECTED_RT_DRIVER_VERSION" ] && NEED_DRIVER=0
+                  NEED_DXRT=1; [ "$CURRENT_DXRT_VERSION" = "$EXPECTED_DXRT_VERSION" ] && NEED_DXRT=0
+                  NEED_FW=1; [ "$CURRENT_FW_VERSION" = "$EXPECTED_FW_VERSION" ] && NEED_FW=0
+                  NEED_DXSTREAM=1; [ "$CURRENT_DXSTREAM_VERSION" = "$EXPECTED_DXSTREAM_VERSION" ] && NEED_DXSTREAM=0
+
+                  if [ "$NEED_DRIVER" -eq 0 ] && [ "$NEED_DXRT" -eq 0 ] && [ "$NEED_FW" -eq 0 ] && [ "$NEED_DXSTREAM" -eq 0 ]; then
+                    echo "All DX-Runtime targets already current (RT Driver ${EXPECTED_RT_DRIVER_VERSION}, DXRT ${EXPECTED_DXRT_VERSION}, FW ${EXPECTED_FW_VERSION}, dxstream ${EXPECTED_DXSTREAM_VERSION}); skipping git clone and install."
+                    exit 0
+                  fi
+
+                  sudo apt-get update && sudo apt-get install -y git
+                  rm -rf dx-runtime
+
+                  echo "Cloning dx-runtime @ {{ git_ref }}"
+                  git clone --branch "{{ git_ref }}" --depth 1 https://github.com/DEEPX-AI/dx-runtime.git
+                  cd dx-runtime
+                  git submodule update --init --recursive
+
+                  CXXOPTS=dx_rt/extern/include/dxrt/extern/cxxopts.hpp
+                  if [ -f "$CXXOPTS" ] && ! grep -q '#include <cstdint>' "$CXXOPTS"; then
+                    sed -i '/#include <cstring>/i #include <cstdint>' "$CXXOPTS"
+                  fi
+
+                  chmod +x install.sh
+
+                  if [ "$NEED_DRIVER" -eq 0 ]; then
+                    echo "RT Driver already at ${EXPECTED_RT_DRIVER_VERSION}; skipping dx_rt_npu_linux_driver."
+                  else
+                    sudo ./install.sh --target=dx_rt_npu_linux_driver
+                  fi
+
+                  if [ "$NEED_DXRT" -eq 0 ]; then
+                    echo "DXRT already at ${EXPECTED_DXRT_VERSION}; skipping dx_rt."
+                  else
+                    sudo ./install.sh --target=dx_rt
+                  fi
+
+                  if [ "$NEED_FW" -eq 0 ]; then
+                    echo "FW already at ${EXPECTED_FW_VERSION}; skipping dx_fw."
+                  else
+                    sudo ./install.sh --target=dx_fw
+                  fi
+
+                  if [ "$NEED_DXSTREAM" -eq 0 ]; then
+                    echo "dxstream already at ${EXPECTED_DXSTREAM_VERSION}; skipping dx_stream."
+                  else
+                    sudo ./install.sh --target=dx_stream
+                  fi
+
+              Run: "echo \"All DX-Runtime targets have been installed successfully.\""
+            Artifacts: []
+        Lifecycle: {}
+
+  GreengrassDeployment:
+    Type: AWS::GreengrassV2::Deployment
+    DependsOn:
+      - DxRuntimeComponent
+    Properties:
+      DeploymentName: !Sub "${AWS::StackName} DX Runtime Deployment"
+      TargetArn: !GetAtt GreengrassThingGroup.Arn
+      Components:
+        com.deepx.dx-runtime:
+          ComponentVersion: !Ref DxRuntimeComponentVersion
+        aws.greengrass.Cli:
+          ComponentVersion: !Ref CliComponentVersion
+
+Outputs:
+  ProjectName:
+    Description: Logical project name.
+    Value: !Ref ProjectName
+  ThingGroupName:
+    Description: AWS IoT thing group for Greengrass core devices.
+    Value: !Ref GreengrassThingGroup
+  TokenExchangeRoleName:
+    Description: Token exchange role name passed to the Greengrass installer.
+    Value: !Ref GreengrassTokenExchangeRole
+  GreengrassDeploymentId:
+    Description: Greengrass deployment that targets the core device thing group.
+    Value: !GetAtt GreengrassDeployment.DeploymentId
