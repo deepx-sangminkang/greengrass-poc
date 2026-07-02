@@ -58,12 +58,16 @@ all compute uses IAM roles.
 
 ## External dependencies (contacted at deploy/run time)
 
-- **Edge runtime source:** each core device runs
-  `git clone --branch <DxRuntimeGitRef> --depth 1 https://github.com/DEEPX-AI/dx-runtime.git`
-  (default tag `v2.3.3`) and builds the DEEPX NPU driver/firmware/dx_rt/dx_stream runtime
-  on first deployment, plus builds the Amazon KVS producer SDK dependency chain via `apt`.
-  This requires outbound internet on the edge device. DEEPX is responsible for this
-  repository's availability.
+- **Edge runtime artifacts:** each core device downloads four prebuilt artifacts over
+  unauthenticated HTTPS from the public bucket `DxRuntimeArtifactBaseUrl` (default
+  `https://deepx-public-bucket.s3.ap-northeast-2.amazonaws.com/dx-runtime`):
+  `dxrt-driver-dkms_2.4.1-2_all.deb`, `dx_rt.tar.gz` (dx_rt main + Ubuntu 26.04 patch),
+  `fw.bin`, and `dx_stream.tar.gz`. On first deployment it installs the NPU driver via
+  `apt`, builds dx_rt and dx_stream from source, and flashes the firmware
+  (`dxrt-cli -u fw.bin`), in the order driver → dx_rt → dx_fw → dx_stream. This requires
+  outbound internet on the edge device (but no S3 credentials, since the bucket is public).
+  Populate the bucket with `scripts/publish-dx-runtime-artifacts.sh`; DEEPX is responsible
+  for the artifacts' availability.
 - **Compiler AMI:** `dxcom` and the calibration dataset are pre-baked into the DEEPX
   Compiler AMI (no deploy-time download for compilation).
 

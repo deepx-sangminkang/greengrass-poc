@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DEEPX Unified Console</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="container">
+    <header>
+        <div class="header-row">
+            <h1>🔧 DEEPX Unified Console</h1>
+        </div>
+        <p class="subtitle">Deploy the combined stack, compile ONNX models, and manage Greengrass edge devices</p>
+    </header>
+
+    <div id="context-bar" class="context-bar">
+        <span class="ctx-chip">🌍 Region: <strong id="ctx-region">-</strong></span>
+        <span class="ctx-chip">📦 Stack: <strong id="ctx-stack">-</strong></span>
+        <span id="ctx-sub" class="ctx-chip">🛒 Marketplace: <strong id="ctx-sub-text">checking…</strong></span>
+    </div>
+
+    <div class="top-tabs">
+        <button class="top-tab active" id="tab-deploy" onclick="switchTab('deploy')">🚀 Deploy</button>
+        <button class="top-tab" id="tab-compile" onclick="switchTab('compile')" disabled>⚙️ Compile</button>
+        <button class="top-tab" id="tab-edge" onclick="switchTab('edge')" disabled>📡 Edge</button>
+    </div>
+
+    <!-- ═══════════ DEPLOY VIEW ═══════════ -->
+    <section id="view-deploy">
+        <div class="setup-card">
+            <h2>AWS Marketplace</h2>
+            <div id="marketplace-box" class="setup-step-body">
+                <p id="marketplace-status">Checking subscription…</p>
+                <a id="marketplace-link" href="#" target="_blank" class="btn btn-primary">🛒 Subscribe on Marketplace</a>
+                <button class="btn btn-secondary" onclick="refreshSetupStatus()">🔄 Recheck</button>
+            </div>
+        </div>
+
+        <div class="setup-card" style="margin-top:1.5rem;">
+            <h2>Existing stacks</h2>
+            <div class="stack-actions" style="margin:0.5rem 0 1rem;">
+                <button class="btn btn-secondary" onclick="loadExistingStacks()">🔄 Refresh stacks</button>
+            </div>
+            <div id="existing-stacks" class="existing-stacks hidden">
+                <div id="stacks-list" class="stacks-list"></div>
+            </div>
+            <p id="no-stacks" class="hint">No stacks found yet.</p>
+        </div>
+
+        <div class="setup-card" style="margin-top:1.5rem;">
+            <h2>Deploy new stack</h2>
+            <div class="deploy-form">
+                <div class="form-field">
+                    <label for="f-stack-name">Stack name <span class="hint">(optional)</span></label>
+                    <input id="f-stack-name" placeholder="auto: dx-marketplace-web-…">
+                </div>
+                <div class="form-field">
+                    <label for="f-bucket">ModelBucketName <span class="req">*</span></label>
+                    <input id="f-bucket" placeholder="my-model-bucket" pattern="[a-z0-9.\-]{3,63}">
+                </div>
+                <div class="form-field">
+                    <label for="f-vpc">VPC <span class="req">*</span></label>
+                    <select id="f-vpc" onchange="loadSubnets(this.value)"><option value="">Loading…</option></select>
+                </div>
+                <div class="form-field">
+                    <label for="f-subnet">Subnet <span class="req">*</span></label>
+                    <select id="f-subnet"><option value="">Select a VPC first</option></select>
+                </div>
+                <div class="form-field">
+                    <label for="f-instance">InstanceType</label>
+                    <select id="f-instance">
+                        <option value="t3.large">t3.large</option>
+                        <option value="t3.xlarge" selected>t3.xlarge</option>
+                        <option value="t3.2xlarge">t3.2xlarge</option>
+                        <option value="m5.xlarge">m5.xlarge</option>
+                        <option value="c5.xlarge">c5.xlarge</option>
+                        <option value="g4dn.xlarge">g4dn.xlarge</option>
+                    </select>
+                </div>
+                <div class="form-field">
+                    <label for="f-ami">AMI</label>
+                    <select id="f-ami"><option value="marketplace">DX Compiler AMI (Marketplace)</option></select>
+                </div>
+                <div class="form-field full">
+                    <label for="f-thing-group">ThingGroupName <span class="hint">(optional)</span></label>
+                    <input id="f-thing-group" placeholder="e.g. DeepxCores">
+                </div>
+            </div>
+
+            <div class="stack-actions">
+                <button class="btn btn-secondary" onclick="validateTemplate()">✅ Validate template</button>
+                <button class="btn btn-secondary" onclick="toggleTemplate()">📄 View template</button>
+                <button id="deploy-btn" class="btn btn-primary" onclick="deployStack()">🚀 Deploy</button>
+            </div>
+
+            <div id="validate-result" class="validate-result hidden"></div>
+            <div id="cf-template-viewer" class="cf-template-viewer hidden"><pre id="cf-template-content"></pre></div>
+            <div id="deploy-status" class="hint" style="margin-top:1rem;"></div>
+            <div id="deploy-events" class="logs-list hidden" style="margin-top:0.5rem;"></div>
+            <div id="deploy-outputs" class="hidden" style="margin-top:1rem;">
+                <h4>✅ Stack outputs</h4>
+                <table class="outputs-table"><tbody id="outputs-body"></tbody></table>
+            </div>
+        </div>
+    </section>
+
+    <!-- ═══════════ COMPILE VIEW (verbatim from compiler-app) ═══════════ -->
+    <section id="view-compile" hidden>
+        <div id="upload-section">
+            <div id="drop-zone" class="drop-zone">
+                <div class="drop-zone-content">
+                    <span class="drop-icon">📁</span>
+                    <p>Drag an ONNX file and a JSON config here, or</p>
+                    <button id="file-btn" class="btn btn-primary">Select files</button>
+                    <input type="file" id="file-input" accept=".onnx,.json" multiple hidden>
+                    <p class="hint">1 ONNX file (.onnx) + 1 JSON config file (.json)</p>
+                    <div id="selected-files" class="selected-files hidden">
+                        <div id="selected-onnx" class="selected-file"></div>
+                        <div id="selected-json" class="selected-file"></div>
+                        <button id="upload-btn" class="btn btn-success hidden">🚀 Start compile</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="progress-section" class="hidden">
+            <div class="job-card">
+                <div class="job-header">
+                    <span id="job-filename" class="job-filename"></span>
+                    <span id="job-status-badge" class="badge"></span>
+                </div>
+                <div class="progress-steps">
+                    <div class="step" id="step-upload"><div class="step-icon">📤</div><div class="step-label">Upload</div></div>
+                    <div class="step-line"></div>
+                    <div class="step" id="step-pending"><div class="step-icon">⏳</div><div class="step-label">Pending</div></div>
+                    <div class="step-line"></div>
+                    <div class="step" id="step-running"><div class="step-icon">⚙️</div><div class="step-label">Compiling</div></div>
+                    <div class="step-line"></div>
+                    <div class="step" id="step-done"><div class="step-icon">✅</div><div class="step-label">Done</div></div>
+                </div>
+                <div id="progress-message" class="progress-message"></div>
+                <div id="elapsed-time" class="elapsed-time hidden">⏱️ Elapsed: 0s</div>
+                <div id="links-section" class="links-section hidden">
+                    <h4>🔗 AWS resource links</h4>
+                    <div id="links-list" class="links-list"></div>
+                </div>
+                <div id="logs-section" class="logs-section hidden">
+                    <h4>📋 Step Functions logs</h4>
+                    <div id="logs-list" class="logs-list"></div>
+                </div>
+                <div id="compiler-logs-section" class="logs-section hidden">
+                    <h4>🖥️ dx_com compiler logs</h4>
+                    <div id="compiler-logs-list" class="logs-list compiler-logs"></div>
+                </div>
+                <div id="action-buttons" class="action-buttons">
+                    <button id="download-btn" class="btn btn-success hidden">⬇️ Download DXNN</button>
+                    <button id="new-btn" class="btn btn-secondary" onclick="resetUI()">🔄 Compile new file</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="error-section" class="hidden">
+            <div class="error-card">
+                <h3>❌ Error</h3>
+                <p id="error-message"></p>
+                <button class="btn btn-secondary" onclick="resetUI()">Try again</button>
+            </div>
+        </div>
+    </section>
+
+    <!-- ═══════════ EDGE VIEW (from greengrass-app) ═══════════ -->
+    <section id="view-edge" hidden>
+        <section class="setup-card">
+            <h2>Core Devices</h2>
+            <p>Thing Group from the active stack: <strong id="devices-thing-group-name">-</strong></p>
+            <div class="field-row">
+                <select id="component-thing-group"></select>
+                <button class="btn btn-secondary" onclick="loadThingGroups()">Refresh Thing Groups</button>
+                <button class="btn btn-secondary" onclick="refreshDeviceList()">Refresh device list</button>
+                <button class="btn btn-secondary" onclick="loadDeviceComponents()">Check install status (all)</button>
+            </div>
+            <div id="device-list" class="core-device-list"></div>
+            <div id="device-components"></div>
+            <pre id="component-output"></pre>
+
+            <div id="device-tabbar" class="tabbar"></div>
+            <section id="device-panel" class="device-section" hidden>
+                <h3 id="device-panel-title">Core Device</h3>
+                <div class="actions">
+                    <button class="btn btn-secondary" onclick="loadActiveDeviceComponents()">Refresh install status</button>
+                </div>
+                <div id="active-device-components"></div>
+            </section>
+        </section>
+
+        <section class="setup-card" style="margin-top:1.5rem;">
+            <h2>Register Core Device</h2>
+            <p>The Thing group and token exchange role use the outputs of the active stack.</p>
+            <div class="field-row">
+                <input id="thing-name" placeholder="Thing name" value="DeepxCore01">
+            </div>
+            <div class="actions">
+                <button class="btn btn-primary" onclick="generateInstallScript()">Generate install script</button>
+                <button class="btn btn-secondary" onclick="loadCoreDevices()">List existing Cores</button>
+            </div>
+            <details open>
+                <summary>Manual installation guide</summary>
+                <ol>
+                    <li>Enter the Thing name. The Thing group and token exchange role use the stack outputs.</li>
+                    <li>Click "Generate install script" to create the Greengrass Core install script.</li>
+                    <li>Copy the generated script and run it on the core device terminal.</li>
+                    <li>Once installation completes, click "List existing Cores" to verify registration.</li>
+                </ol>
+                <details open>
+                    <summary>Shell commands to enter directly on the core device</summary>
+                    <p>Paste the commands below into the core device terminal. Replace the <code>&lt;...&gt;</code> parts with actual values (or use "Generate install script" above to produce a filled-in script).</p>
+                    <button type="button" class="btn btn-secondary" onclick="copyManualCommands()">Copy commands</button>
+                    <pre><code id="manual-install-commands"># 0. Configure AWS credentials (required before installation)
+export AWS_ACCESS_KEY_ID=&lt;access-key&gt;
+export AWS_SECRET_ACCESS_KEY=&lt;secret-key&gt;
+export AWS_SESSION_TOKEN=&lt;session-token&gt;   # if using temporary credentials
+# or: aws configure
+
+# 1. Check whether Java is installed (install if missing)
+if ! command -v java &gt;/dev/null 2&gt;&amp;1; then
+  echo "Java is required before installing AWS IoT Greengrass Core."
+  exit 1
+fi
+
+# 2. Download &amp; unzip Greengrass Nucleus
+curl -s https://d2s8p88vqu9w66.cloudfront.net/releases/greengrass-nucleus-latest.zip &gt; greengrass-nucleus-latest.zip
+rm -rf GreengrassInstaller
+unzip -q greengrass-nucleus-latest.zip -d GreengrassInstaller
+
+# 3. Install Greengrass Core (auto-provisioning + system service registration)
+sudo -E java -Droot="/greengrass/v2" -Dlog.store=FILE \
+  -jar ./GreengrassInstaller/lib/Greengrass.jar \
+  --aws-region &lt;region&gt; \
+  --thing-name &lt;thing_name&gt; \
+  --thing-group-name &lt;thing_group_name&gt; \
+  --tes-role-name &lt;token_exchange_role_name&gt; \
+  --component-default-user 'ggc_user:ggc_group' \
+  --provision true \
+  --setup-system-service true \
+  --deploy-dev-tools true
+
+# 4. Check service status
+sudo systemctl status greengrass.service --no-pager</code></pre>
+                </details>
+                <details>
+                    <summary>Detailed guide</summary>
+                    <p>The core device requires <strong>Java (JDK 8 or higher)</strong> and <strong>sudo privileges</strong>. The script checks whether Java is installed with <code>command -v java</code> and aborts if it is not (it does not auto-install Java).</p>
+                    <pre><code># Debian/Ubuntu
+sudo apt-get update &amp;&amp; sudo apt-get install -y default-jdk
+
+# Amazon Linux/RHEL
+sudo yum install -y java-11-amazon-corretto-headless</code></pre>
+                    <p class="warn"><strong>⚠ Configure AWS credentials in advance.</strong> The install script does not include static keys. The <code>--provision true</code> provisioning uses the credentials from the core device-side environment variables passed through <code>sudo -E</code>, so configure credentials on the device before running the installation.</p>
+                </details>
+            </details>
+            <div id="core-device-list" class="core-device-list"></div>
+            <p id="selected-core-output" class="selected-core">No core device selected.</p>
+            <details>
+                <summary>Advanced: Run installation via SSH</summary>
+                <p class="warn">SSH installation sends the AWS credentials used by this server to the core device for <code>--provision true</code> provisioning. Credentials are passed only via <code>sudo bash</code> standard input and are not exposed in the process list.</p>
+                <div class="field-row">
+                    <input id="ssh-host" placeholder="SSH host">
+                    <input id="ssh-user" placeholder="SSH username">
+                    <input id="ssh-port" placeholder="SSH port (default 22)" type="number" min="1" max="65535">
+                    <input id="ssh-password" placeholder="SSH password" type="password">
+                    <input id="ssh-key" placeholder="Private key path">
+                </div>
+                <button class="btn btn-primary" onclick="runSshInstall()">Run SSH installation</button>
+            </details>
+            <pre id="device-output"></pre>
+        </section>
+    </section>
+
+    <footer>
+        <p>DEEPX Solution &copy; 2026</p>
+    </footer>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

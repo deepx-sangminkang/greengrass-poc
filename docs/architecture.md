@@ -31,10 +31,10 @@ flowchart TB
         TG{{"IoT Thing Group"}}
         TER["Token exchange role<br/>(logs-scoped)"]
         DEV["Edge core devices (DEEPX NPU)<br/>install driver/fw/dx_rt/dx_stream runtime"]
-        GH["github.com/DEEPX-AI/dx-runtime @ DxRuntimeGitRef<br/>(deploy-time clone — disclosed dependency)"]
+        GH["deepx-public-bucket/dx-runtime/ (public S3)<br/>driver.deb · dx_rt.tar.gz · fw.bin · dx_stream.tar.gz<br/>(deploy-time HTTPS download — disclosed dependency)"]
         PUB --> DEP --> TG -.deploys.-> DEV
         DEV -->|assume| TER
-        DEV -->|clone+build| GH
+        DEV -->|download+build| GH
     end
 
     buyer --> Compile
@@ -49,7 +49,8 @@ flowchart TB
    writes `model.dxnn` back to S3, and terminates the instance.
 2. **Edge deploy**: the stack publishes `com.deepx.dx-runtime` and creates a Greengrass
    deployment to the thing group; edge NPU core devices join the group and install the
-   DEEPX runtime (pinned `DxRuntimeGitRef`, default `v2.3.3`).
+   DEEPX runtime from the public S3 artifacts (`DxRuntimeArtifactBaseUrl`, default
+   `https://deepx-public-bucket.s3.ap-northeast-2.amazonaws.com/dx-runtime`).
 3. The compiled `.dxnn` is delivered to the edge device and runs on the DEEPX NPU.
 
 ## Resource groups (see the template for detail)

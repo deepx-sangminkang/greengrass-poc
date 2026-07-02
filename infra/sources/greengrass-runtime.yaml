@@ -22,11 +22,14 @@ Parameters:
     Type: String
     Default: "1.0.7"
     Description: Existing published version of the com.deepx.dx-runtime component to deploy.
-  DxRuntimeGitRef:
+  DxRuntimeArtifactBaseUrl:
     Type: String
-    Default: "v2.3.3"
+    Default: "https://deepx-public-bucket.s3.ap-northeast-2.amazonaws.com/dx-runtime"
     Description: >-
-      Immutable git tag/commit of DEEPX-AI/dx-runtime to clone at deploy time.
+      Public S3 base URL for the DX-Runtime install artifacts the component
+      downloads at deploy time: dxrt-driver-dkms_2.4.1-2_all.deb (NPU driver),
+      dx_rt.tar.gz (dx_rt main + Ubuntu 26.04 cstdint patch), fw.bin, and
+      dx_stream.tar.gz (dx_stream main).
   CliComponentVersion:
     Type: String
     Default: "2.17.0"
@@ -264,7 +267,7 @@ Resources:
       AccountId: !Ref "AWS::AccountId"
       Substitutions:
         version: !Ref DxRuntimeComponentVersion
-        git_ref: !Ref DxRuntimeGitRef
+        artifact_base_url: !Ref DxRuntimeArtifactBaseUrl
       Recipe: |
         RecipeFormatVersion: "2020-01-25"
         ComponentName: "com.deepx.dx-runtime"
@@ -277,17 +280,21 @@ Resources:
               os: "linux"
             Lifecycle:
               Install:
-                Timeout: 1800
+                # 2h: a fresh device builds dx_rt AND dx_stream from source, and
+                # dx_stream's installer falls back to compiling OpenCV+GStreamer from
+                # source when apt has no >=4.2 candidate (likely on Ubuntu 26.04),
+                # which alone can take 30-90 min on a low-core aarch64 edge device.
+                Timeout: 7200
                 Script: |
-                  echo "Starting DX-Runtime Step-by-Step Installation..."
+                  echo "Starting DX-Runtime S3-artifact installation..."
 
-                  # Environment required for dxrt-cli / gst-inspect-1.0 (dxstream)
-                  # to resolve their binaries, libraries, and GStreamer plugins.
+                  # Environment required for dxrt-cli / gst-inspect-1.0 (dxstream) to resolve
+                  # their binaries, libraries, and GStreamer plugins during version detection and
+                  # firmware flashing.
                   export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
 
-                  # Resolve the multiarch triplet so plugin/library paths work on
-                  # both x86_64 and aarch64 (Raspberry Pi) hosts instead of being
-                  # hardcoded to x86_64-linux-gnu.
+                  # Resolve the multiarch triplet so plugin/library paths work on both x86_64 and
+                  # aarch64 (Raspberry Pi) hosts instead of being hardcoded to x86_64-linux-gnu.
                   GST_ARCH_TRIPLET="$(gcc -dumpmachine 2>/dev/null || true)"
                   if [ -z "$GST_ARCH_TRIPLET" ]; then
                     case "$(uname -m)" in
@@ -303,81 +310,106 @@ Resources:
                   export LD_LIBRARY_PATH="${GST_PLUGIN_DIR}:/usr/local/share/gstdxstream/lib:$LD_LIBRARY_PATH"
                   export PATH="/usr/local/share/gstdxstream/bin:/usr/local/bin:$PATH"
 
-                  # Detect installed versions up front so we can skip the git clone
-                  # and the whole install when every target is already current.
-                  # dxrt-cli / gst-inspect-1.0 may be absent on a fresh host, in
-                  # which case every target is installed.
+                  # Public S3 base URL + artifact keys. Downloads use unauthenticated HTTPS, so no
+                  # S3 IAM grant on the token-exchange role is required (the bucket is public).
+                  ARTIFACT_BASE_URL="{{ artifact_base_url }}"
+                  DRIVER_DEB="dxrt-driver-dkms_2.4.1-2_all.deb"
+                  DXRT_TARBALL="dx_rt.tar.gz"
+                  FW_BIN="fw.bin"
+                  DXSTREAM_TARBALL="dx_stream.tar.gz"
+
+                  # Pinned artifact versions used for the idempotency skip check. driver/fw are
+                  # fixed releases; dx_rt/dx_stream are built from a moving main branch, so their
+                  # skip signal is "binary/plugin already present" rather than a version match.
                   DXRT_CLI="/usr/local/bin/dxrt-cli"
-                  # These payload versions must be validated against DxRuntimeGitRef on a real device.
                   EXPECTED_RT_DRIVER_VERSION="v2.4.1"
-                  EXPECTED_DXRT_VERSION="v3.3.2"
                   EXPECTED_FW_VERSION="v2.5.6"
-                  EXPECTED_DXSTREAM_VERSION="3.0.1"
 
                   DXRT_STATUS=""
                   if [ -x "$DXRT_CLI" ]; then
                     DXRT_STATUS="$("$DXRT_CLI" -s 2>/dev/null || true)"
                   fi
-
-                  CURRENT_DXRT_VERSION="$(printf '%s\n' "$DXRT_STATUS" | grep -oE 'DXRT v[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | awk '{print $2}')"
                   CURRENT_RT_DRIVER_VERSION="$(printf '%s\n' "$DXRT_STATUS" | grep -E 'RT Driver version' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
                   CURRENT_FW_VERSION="$(printf '%s\n' "$DXRT_STATUS" | grep -E 'FW version' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
 
-                  CURRENT_DXSTREAM_VERSION=""
-                  if command -v gst-inspect-1.0 >/dev/null 2>&1; then
-                    CURRENT_DXSTREAM_VERSION="$(gst-inspect-1.0 dxstream 2>/dev/null | grep -E '^[[:space:]]*Version' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+                  NEED_DRIVER=1; [ "$CURRENT_RT_DRIVER_VERSION" = "$EXPECTED_RT_DRIVER_VERSION" ] && NEED_DRIVER=0
+                  NEED_DXRT=1; [ -x "$DXRT_CLI" ] && NEED_DXRT=0
+                  NEED_FW=1; [ "$CURRENT_FW_VERSION" = "$EXPECTED_FW_VERSION" ] && NEED_FW=0
+                  NEED_DXSTREAM=1
+                  if command -v gst-inspect-1.0 >/dev/null 2>&1 && gst-inspect-1.0 dxstream >/dev/null 2>&1; then
+                    NEED_DXSTREAM=0
                   fi
 
-
-                  NEED_DRIVER=1; [ "$CURRENT_RT_DRIVER_VERSION" = "$EXPECTED_RT_DRIVER_VERSION" ] && NEED_DRIVER=0
-                  NEED_DXRT=1; [ "$CURRENT_DXRT_VERSION" = "$EXPECTED_DXRT_VERSION" ] && NEED_DXRT=0
-                  NEED_FW=1; [ "$CURRENT_FW_VERSION" = "$EXPECTED_FW_VERSION" ] && NEED_FW=0
-                  NEED_DXSTREAM=1; [ "$CURRENT_DXSTREAM_VERSION" = "$EXPECTED_DXSTREAM_VERSION" ] && NEED_DXSTREAM=0
-
                   if [ "$NEED_DRIVER" -eq 0 ] && [ "$NEED_DXRT" -eq 0 ] && [ "$NEED_FW" -eq 0 ] && [ "$NEED_DXSTREAM" -eq 0 ]; then
-                    echo "All DX-Runtime targets already current (RT Driver ${EXPECTED_RT_DRIVER_VERSION}, DXRT ${EXPECTED_DXRT_VERSION}, FW ${EXPECTED_FW_VERSION}, dxstream ${EXPECTED_DXSTREAM_VERSION}); skipping git clone and install."
+                    echo "All DX-Runtime targets already present (RT Driver ${EXPECTED_RT_DRIVER_VERSION}, dxrt-cli, FW ${EXPECTED_FW_VERSION}, dxstream); skipping download and install."
                     exit 0
                   fi
 
-                  sudo apt-get update && sudo apt-get install -y git
-                  rm -rf dx-runtime
+                  # Fail hard from here on so a broken install marks the component BROKEN rather
+                  # than silently continuing. (Kept out of the detection block above, where empty
+                  # grep matches are expected and must not abort.)
+                  set -e
 
-                  echo "Cloning dx-runtime @ {{ git_ref }}"
-                  git clone --branch "{{ git_ref }}" --depth 1 https://github.com/DEEPX-AI/dx-runtime.git
-                  cd dx-runtime
-                  git submodule update --init --recursive
+                  sudo apt-get update
+                  sudo apt-get install -y curl tar ca-certificates
 
-                  CXXOPTS=dx_rt/extern/include/dxrt/extern/cxxopts.hpp
-                  if [ -f "$CXXOPTS" ] && ! grep -q '#include <cstdint>' "$CXXOPTS"; then
-                    sed -i '/#include <cstring>/i #include <cstdint>' "$CXXOPTS"
-                  fi
+                  WORK_DIR="$(mktemp -d)"
+                  cd "$WORK_DIR"
 
-                  chmod +x install.sh
+                  fetch() { curl -fSL --retry 3 -o "$2" "$1"; }
 
+                  # Build/flash order: dx_rt_npu_linux_driver -> dx_rt -> dx_fw -> dx_stream
+
+                  # 1) NPU Linux driver (DKMS .deb). DKMS builds the module against the running
+                  # kernel, so pull kernel headers + dkms first (best-effort: the .deb install
+                  # surfaces the real error if headers for this exact kernel are unavailable).
                   if [ "$NEED_DRIVER" -eq 0 ]; then
                     echo "RT Driver already at ${EXPECTED_RT_DRIVER_VERSION}; skipping dx_rt_npu_linux_driver."
                   else
-                    sudo ./install.sh --target=dx_rt_npu_linux_driver
+                    echo "Installing NPU driver from ${ARTIFACT_BASE_URL}/${DRIVER_DEB}"
+                    fetch "${ARTIFACT_BASE_URL}/${DRIVER_DEB}" "${DRIVER_DEB}"
+                    sudo apt-get install -y dkms "linux-headers-$(uname -r)" || true
+                    sudo apt-get install -y "./${DRIVER_DEB}"
                   fi
 
+                  # 2) dx_rt (main branch + Ubuntu 26.04 cstdint patch, prebuilt tarball).
                   if [ "$NEED_DXRT" -eq 0 ]; then
-                    echo "DXRT already at ${EXPECTED_DXRT_VERSION}; skipping dx_rt."
+                    echo "dx_rt already installed (dxrt-cli present); skipping."
                   else
-                    sudo ./install.sh --target=dx_rt
+                    echo "Installing dx_rt from ${ARTIFACT_BASE_URL}/${DXRT_TARBALL}"
+                    fetch "${ARTIFACT_BASE_URL}/${DXRT_TARBALL}" "${DXRT_TARBALL}"
+                    rm -rf dx_rt
+                    tar xzf "${DXRT_TARBALL}"
+                    cd dx_rt
+                    ./install.sh --all
+                    ./build.sh
+                    cd "$WORK_DIR"
                   fi
 
+                  # 3) dx_fw (requires dx_rt: flashed via dxrt-cli).
                   if [ "$NEED_FW" -eq 0 ]; then
                     echo "FW already at ${EXPECTED_FW_VERSION}; skipping dx_fw."
                   else
-                    sudo ./install.sh --target=dx_fw
+                    echo "Flashing firmware from ${ARTIFACT_BASE_URL}/${FW_BIN}"
+                    fetch "${ARTIFACT_BASE_URL}/${FW_BIN}" "${FW_BIN}"
+                    sudo "$DXRT_CLI" -u "${FW_BIN}"
                   fi
 
+                  # 4) dx_stream (main branch, prebuilt tarball). NOTE: dx_stream install.sh
+                  # installs every dependency by default and has NO --all flag -- it hard-errors
+                  # (exit 1) on unknown arguments -- so it must be invoked with no arguments.
                   if [ "$NEED_DXSTREAM" -eq 0 ]; then
-                    echo "dxstream already at ${EXPECTED_DXSTREAM_VERSION}; skipping dx_stream."
+                    echo "dx_stream already installed (dxstream plugin present); skipping."
                   else
-                    sudo ./install.sh --target=dx_stream
+                    echo "Installing dx_stream from ${ARTIFACT_BASE_URL}/${DXSTREAM_TARBALL}"
+                    fetch "${ARTIFACT_BASE_URL}/${DXSTREAM_TARBALL}" "${DXSTREAM_TARBALL}"
+                    rm -rf dx_stream
+                    tar xzf "${DXSTREAM_TARBALL}"
+                    cd dx_stream
+                    ./install.sh
+                    ./build.sh
+                    cd "$WORK_DIR"
                   fi
-
               Run: "echo \"All DX-Runtime targets have been installed successfully.\""
             Artifacts: []
         Lifecycle: {}

@@ -52,7 +52,7 @@ parameter, or output collisions): **10 parameters, 19 resources, 8 outputs**.
   `EC2InstanceRole`/`Profile`. Params: `ImageId`, `ModelBucketName`, `InstanceType`, `VpcId`, `SubnetId`.
 - Greengrass side: `GreengrassThingGroup`, `GreengrassTokenExchangeRole`,
   `ComponentPublishFunction` (+role), `DxRuntimeComponent`, `GreengrassDeployment`.
-  Params: `ProjectName`, `ThingGroupName`, `DxRuntimeComponentVersion`, `DxRuntimeGitRef`,
+  Params: `ProjectName`, `ThingGroupName`, `DxRuntimeComponentVersion`, `DxRuntimeArtifactBaseUrl`,
   `CliComponentVersion`.
 
 ## Validate
@@ -73,8 +73,9 @@ Current status: `cfn-lint` clean, `validate-template` passes (10 params, CAPABIL
   the Marketplace deliverable.
 - Per-template 1100x700 architecture diagram (required for the delivery template).
 - Usage instructions disclosing every IAM role the template creates, the IoT/Greengrass
-  resources, and the deploy-time `git clone` of `github.com/DEEPX-AI/dx-runtime`
-  (external dependency — must be disclosed and self-service).
+  resources, and the deploy-time download of the DX-Runtime artifacts from the public
+  `deepx-public-bucket/dx-runtime/` (external dependency — must be disclosed and self-service;
+  populate the bucket with `scripts/publish-dx-runtime-artifacts.sh`).
 - Least-privilege pass on the token-exchange, StepFunctions, and EC2 instance roles.
 - Confirm the runtime `ec2:runInstances` (Step Functions) launch pattern + this combined
   shape with AWS Marketplace seller-ops.
