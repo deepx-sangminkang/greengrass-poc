@@ -19,7 +19,7 @@ def test_session_endpoint_returns_csrf_token():
 
 
 def test_default_component_version_matches_deployed_runtime_recipe():
-    assert config.DEFAULT_COMPONENT_VERSION == "1.0.8"
+    assert config.DEFAULT_COMPONENT_VERSION == "2.0.0"
 
 
 def test_install_script_requires_csrf_token():

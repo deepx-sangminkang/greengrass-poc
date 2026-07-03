@@ -101,15 +101,15 @@ Parameters:
       coexist in the same account.
   DxRuntimeComponentVersion:
     Type: String
-    Default: "1.0.8"
+    Default: "2.0.0"
     Description: Existing published version of the com.deepx.dx-runtime component to deploy.
   DxRuntimeArtifactBaseUrl:
     Type: String
     Default: "https://deepx-public-bucket.s3.ap-northeast-2.amazonaws.com/dx-runtime"
     Description: >-
       Public S3 base URL for the DX-Runtime install artifacts the component
-      downloads at deploy time: dxrt-driver-dkms_2.4.1-2_all.deb (NPU driver),
-      dx_rt.tar.gz (dx_rt main + Ubuntu 26.04 cstdint patch), fw.bin, and
+      downloads at deploy time: dxrt-driver-dkms_2.5.0-2_all.deb (NPU driver),
+      dx_rt.tar.gz (dx_rt staging, Ubuntu 26.04 fix already in-branch), fw.bin, and
       dx_stream.tar.gz (dx_stream main).
   CliComponentVersion:
     Type: String
@@ -1195,7 +1195,7 @@ Resources:
                   # Public S3 base URL + artifact keys. Downloads use unauthenticated HTTPS, so no
                   # S3 IAM grant on the token-exchange role is required (the bucket is public).
                   ARTIFACT_BASE_URL="{{ artifact_base_url }}"
-                  DRIVER_DEB="dxrt-driver-dkms_2.4.1-2_all.deb"
+                  DRIVER_DEB="dxrt-driver-dkms_2.5.0-2_all.deb"
                   DXRT_TARBALL="dx_rt.tar.gz"
                   FW_BIN="fw.bin"
                   DXSTREAM_TARBALL="dx_stream.tar.gz"
@@ -1204,8 +1204,8 @@ Resources:
                   # fixed releases; dx_rt/dx_stream are built from a moving main branch, so their
                   # skip signal is "binary/plugin already present" rather than a version match.
                   DXRT_CLI="/usr/local/bin/dxrt-cli"
-                  EXPECTED_RT_DRIVER_VERSION="v2.4.1"
-                  EXPECTED_FW_VERSION="v2.5.6"
+                  EXPECTED_RT_DRIVER_VERSION="v2.5.0"
+                  EXPECTED_FW_VERSION="v2.7.0"
 
                   DXRT_STATUS=""
                   if [ -x "$DXRT_CLI" ]; then
@@ -1254,7 +1254,7 @@ Resources:
                     sudo apt-get install -y "./${DRIVER_DEB}"
                   fi
 
-                  # 2) dx_rt (main branch + Ubuntu 26.04 cstdint patch, prebuilt tarball).
+                  # 2) dx_rt (staging branch, Ubuntu 26.04 fix already in-branch; prebuilt tarball).
                   if [ "$NEED_DXRT" -eq 0 ]; then
                     echo "dx_rt already installed (dxrt-cli present); skipping."
                   else
