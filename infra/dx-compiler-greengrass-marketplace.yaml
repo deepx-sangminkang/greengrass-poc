@@ -101,7 +101,7 @@ Parameters:
       coexist in the same account.
   DxRuntimeComponentVersion:
     Type: String
-    Default: "1.0.7"
+    Default: "1.0.8"
     Description: Existing published version of the com.deepx.dx-runtime component to deploy.
   DxRuntimeArtifactBaseUrl:
     Type: String
