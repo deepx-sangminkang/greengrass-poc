@@ -61,9 +61,9 @@ all compute uses IAM roles.
 - **Edge runtime artifacts:** each core device downloads four prebuilt artifacts over
   unauthenticated HTTPS from the public bucket `DxRuntimeArtifactBaseUrl` (default
   `https://deepx-public-bucket.s3.ap-northeast-2.amazonaws.com/dx-runtime`):
-  `dxrt-driver-dkms_2.5.0-2_all.deb`, `dx_rt.tar.gz` (dx_rt staging, Ubuntu 26.04 fix in-branch),
-  `fw.bin`, and `dx_stream.tar.gz`. On first deployment it installs the NPU driver via
-  `apt`, builds dx_rt and dx_stream from source, and flashes the firmware
+  `dxrt-driver-dkms_2.5.1-2_all.deb`, `libdxrt-bin_3.4.0_{amd64,arm64}.deb` (dx_rt prebuilt
+  Debian package), `fw.bin`, and `dx_stream.tar.gz`. On first deployment it installs the NPU
+  driver and dx_rt via `apt`, builds dx_stream from source, and flashes the firmware
   (`dxrt-cli -u fw.bin`), in the order driver → dx_rt → dx_fw → dx_stream. This requires
   outbound internet on the edge device (but no S3 credentials, since the bucket is public).
   Populate the bucket with `scripts/publish-dx-runtime-artifacts.sh`; DEEPX is responsible

@@ -8,10 +8,11 @@
 # infra/dx-compiler-greengrass-marketplace.yaml).
 #
 # Artifacts produced (keys under s3://$BUCKET/$PREFIX/):
-#   dxrt-driver-dkms_2.5.0-2_all.deb  NPU Linux driver (DKMS), from dx_rt_npu_linux_driver staging
-#   dx_rt.tar.gz                      dx_rt staging branch (Ubuntu 26.04 fix already in-branch)
-#   fw.bin                            firmware, from dx_fw staging m1/2.7.0/mdot2
-#   dx_stream.tar.gz                  dx_stream main branch
+#   dxrt-driver-dkms_2.5.1-2_all.deb  NPU Linux driver (DKMS), from dx_rt_npu_linux_driver staging
+#   libdxrt-bin_3.4.0_amd64.deb       dx_rt prebuilt Debian package (x86_64), from dx_rt staging
+#   libdxrt-bin_3.4.0_arm64.deb       dx_rt prebuilt Debian package (aarch64), from dx_rt staging
+#   fw.bin                            firmware, from dx_fw staging m1/2.7.1/mdot2
+#   dx_stream.tar.gz                  dx_stream staging branch
 #
 # On the device the build/flash order is:
 #   dx_rt_npu_linux_driver -> dx_rt -> dx_fw -> dx_stream
@@ -31,15 +32,17 @@ REGION="${AWS_REGION:-ap-northeast-2}"
 
 DRIVER_REPO="${DX_DRIVER_REPO:-https://github.com/DEEPX-AI/dx_rt_npu_linux_driver.git}"
 DRIVER_REF="${DX_DRIVER_REF:-staging}"
-DRIVER_DEB_PATH="${DX_DRIVER_DEB_PATH:-release/2.5.0/dxrt-driver-dkms_2.5.0-2_all.deb}"
+DRIVER_DEB_PATH="${DX_DRIVER_DEB_PATH:-release/2.5.1/dxrt-driver-dkms_2.5.1-2_all.deb}"
 DRIVER_DEB="$(basename "$DRIVER_DEB_PATH")"
 DXRT_REPO="${DX_RT_REPO:-https://github.com/DEEPX-AI/dx_rt.git}"
 DXRT_REF="${DX_RT_REF:-staging}"
+DXRT_DEB_AMD64_PATH="${DX_RT_DEB_AMD64_PATH:-release/3.4.0/libdxrt-bin_3.4.0_amd64.deb}"
+DXRT_DEB_ARM64_PATH="${DX_RT_DEB_ARM64_PATH:-release/3.4.0/libdxrt-bin_3.4.0_arm64.deb}"
 FW_REPO="${DX_FW_REPO:-https://github.com/DEEPX-AI/dx_fw.git}"
 FW_REF="${DX_FW_REF:-staging}"
-FW_PATH="${DX_FW_PATH:-m1/2.7.0/mdot2/fw.bin}"
+FW_PATH="${DX_FW_PATH:-m1/2.7.1/mdot2/fw.bin}"
 DXSTREAM_REPO="${DX_STREAM_REPO:-https://github.com/DEEPX-AI/dx_stream.git}"
-DXSTREAM_REF="${DX_STREAM_REF:-main}"
+DXSTREAM_REF="${DX_STREAM_REF:-staging}"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -54,10 +57,10 @@ echo "==> [1/4] dx_rt_npu_linux_driver: ${DRIVER_REF}:${DRIVER_DEB_PATH}"
 git clone --depth 1 --branch "$DRIVER_REF" "$DRIVER_REPO" driver
 cp "driver/${DRIVER_DEB_PATH}" "$OUT/${DRIVER_DEB}"
 
-echo "==> [2/4] dx_rt: ${DXRT_REF} (Ubuntu 26.04 fix already in-branch; no patch)"
+echo "==> [2/4] dx_rt: ${DXRT_REF} prebuilt Debian packages (amd64 + arm64)"
 git clone --depth 1 --branch "$DXRT_REF" "$DXRT_REPO" dx_rt
-rm -rf dx_rt/.git
-tar czf "$OUT/dx_rt.tar.gz" dx_rt
+cp "dx_rt/${DXRT_DEB_AMD64_PATH}" "$OUT/$(basename "$DXRT_DEB_AMD64_PATH")"
+cp "dx_rt/${DXRT_DEB_ARM64_PATH}" "$OUT/$(basename "$DXRT_DEB_ARM64_PATH")"
 
 echo "==> [3/4] dx_fw: ${FW_REF}:${FW_PATH}"
 git clone --depth 1 --branch "$FW_REF" "$FW_REPO" dx_fw
@@ -69,7 +72,7 @@ rm -rf dx_stream/.git
 tar czf "$OUT/dx_stream.tar.gz" dx_stream
 
 echo "==> Uploading to s3://${BUCKET}/${PREFIX}/ (region ${REGION})"
-for f in "$DRIVER_DEB" dx_rt.tar.gz fw.bin dx_stream.tar.gz; do
+for f in "$DRIVER_DEB" "$(basename "$DXRT_DEB_AMD64_PATH")" "$(basename "$DXRT_DEB_ARM64_PATH")" fw.bin dx_stream.tar.gz; do
   aws s3 cp "$OUT/$f" "s3://${BUCKET}/${PREFIX}/${f}" --region "$REGION"
   echo "    uploaded ${f}"
 done

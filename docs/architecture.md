@@ -31,7 +31,7 @@ flowchart TB
         TG{{"IoT Thing Group"}}
         TER["Token exchange role<br/>(logs-scoped)"]
         DEV["Edge core devices (DEEPX NPU)<br/>install driver/fw/dx_rt/dx_stream runtime"]
-        GH["deepx-public-bucket/dx-runtime/ (public S3)<br/>driver.deb · dx_rt.tar.gz · fw.bin · dx_stream.tar.gz<br/>(deploy-time HTTPS download — disclosed dependency)"]
+        GH["deepx-public-bucket/dx-runtime/ (public S3)<br/>driver.deb · libdxrt-bin.deb · fw.bin · dx_stream.tar.gz<br/>(deploy-time HTTPS download — disclosed dependency)"]
         PUB --> DEP --> TG -.deploys.-> DEV
         DEV -->|assume| TER
         DEV -->|download+build| GH

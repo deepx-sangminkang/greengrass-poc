@@ -101,16 +101,16 @@ Parameters:
       coexist in the same account.
   DxRuntimeComponentVersion:
     Type: String
-    Default: "2.0.0"
+    Default: "2.3.0"
     Description: Existing published version of the com.deepx.dx-runtime component to deploy.
   DxRuntimeArtifactBaseUrl:
     Type: String
     Default: "https://deepx-public-bucket.s3.ap-northeast-2.amazonaws.com/dx-runtime"
     Description: >-
       Public S3 base URL for the DX-Runtime install artifacts the component
-      downloads at deploy time: dxrt-driver-dkms_2.5.0-2_all.deb (NPU driver),
-      dx_rt.tar.gz (dx_rt staging, Ubuntu 26.04 fix already in-branch), fw.bin, and
-      dx_stream.tar.gz (dx_stream main).
+      downloads at deploy time: dxrt-driver-dkms_2.5.1-2_all.deb (NPU driver),
+      libdxrt-bin_3.4.0_{amd64,arm64}.deb (dx_rt prebuilt Debian package), fw.bin, and
+      dx_stream.tar.gz (dx_stream staging).
   CliComponentVersion:
     Type: String
     Default: "2.17.0"
@@ -1162,8 +1162,7 @@ Resources:
               os: "linux"
             Lifecycle:
               Install:
-                # 2h: a fresh device builds dx_rt AND dx_stream from source, and
-                # dx_stream's installer falls back to compiling OpenCV+GStreamer from
+                # 2h: dx_stream's installer falls back to compiling OpenCV+GStreamer from
                 # source when apt has no >=4.2 candidate (likely on Ubuntu 26.04),
                 # which alone can take 30-90 min on a low-core aarch64 edge device.
                 Timeout: 7200
@@ -1195,17 +1194,17 @@ Resources:
                   # Public S3 base URL + artifact keys. Downloads use unauthenticated HTTPS, so no
                   # S3 IAM grant on the token-exchange role is required (the bucket is public).
                   ARTIFACT_BASE_URL="{{ artifact_base_url }}"
-                  DRIVER_DEB="dxrt-driver-dkms_2.5.0-2_all.deb"
-                  DXRT_TARBALL="dx_rt.tar.gz"
+                  DRIVER_DEB="dxrt-driver-dkms_2.5.1-2_all.deb"
+                  DXRT_DEB_VERSION="3.4.0"
                   FW_BIN="fw.bin"
                   DXSTREAM_TARBALL="dx_stream.tar.gz"
 
                   # Pinned artifact versions used for the idempotency skip check. driver/fw are
-                  # fixed releases; dx_rt/dx_stream are built from a moving main branch, so their
-                  # skip signal is "binary/plugin already present" rather than a version match.
+                  # fixed releases; dx_rt (Debian pkg) and dx_stream skip on "binary/plugin
+                  # already present" rather than a version match.
                   DXRT_CLI="/usr/local/bin/dxrt-cli"
-                  EXPECTED_RT_DRIVER_VERSION="v2.5.0"
-                  EXPECTED_FW_VERSION="v2.7.0"
+                  EXPECTED_RT_DRIVER_VERSION="v2.5.1"
+                  EXPECTED_FW_VERSION="v2.7.1"
 
                   DXRT_STATUS=""
                   if [ -x "$DXRT_CLI" ]; then
@@ -1254,17 +1253,17 @@ Resources:
                     sudo apt-get install -y "./${DRIVER_DEB}"
                   fi
 
-                  # 2) dx_rt (staging branch, Ubuntu 26.04 fix already in-branch; prebuilt tarball).
+                  # 2) dx_rt (staging release/3.4.0, prebuilt Debian binary package libdxrt-bin).
                   if [ "$NEED_DXRT" -eq 0 ]; then
                     echo "dx_rt already installed (dxrt-cli present); skipping."
                   else
-                    echo "Installing dx_rt from ${ARTIFACT_BASE_URL}/${DXRT_TARBALL}"
-                    fetch "${ARTIFACT_BASE_URL}/${DXRT_TARBALL}" "${DXRT_TARBALL}"
-                    rm -rf dx_rt
-                    tar xzf "${DXRT_TARBALL}"
-                    cd dx_rt
-                    ./install.sh --all
-                    ./build.sh
+                    # Arch-specific prebuilt package: dpkg's arch name matches the .deb suffix
+                    # exactly on Debian/Ubuntu (amd64 / arm64). apt-get resolves Depends and
+                    # runs the postinst (ldconfig + dx_engine wheel into the system python3).
+                    DXRT_DEB="libdxrt-bin_${DXRT_DEB_VERSION}_$(dpkg --print-architecture).deb"
+                    echo "Installing dx_rt Debian package from ${ARTIFACT_BASE_URL}/${DXRT_DEB}"
+                    fetch "${ARTIFACT_BASE_URL}/${DXRT_DEB}" "${DXRT_DEB}"
+                    sudo apt-get install -y "./${DXRT_DEB}"
                     cd "$WORK_DIR"
                   fi
 
@@ -1277,7 +1276,7 @@ Resources:
                     sudo "$DXRT_CLI" -u "${FW_BIN}"
                   fi
 
-                  # 4) dx_stream (main branch, prebuilt tarball). NOTE: dx_stream install.sh
+                  # 4) dx_stream (staging branch, prebuilt tarball). NOTE: dx_stream install.sh
                   # installs every dependency by default and has NO --all flag -- it hard-errors
                   # (exit 1) on unknown arguments -- so it must be invoked with no arguments.
                   if [ "$NEED_DXSTREAM" -eq 0 ]; then
