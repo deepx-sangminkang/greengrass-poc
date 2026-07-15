@@ -1259,7 +1259,13 @@ Resources:
                   else
                     # Arch-specific prebuilt package: dpkg's arch name matches the .deb suffix
                     # exactly on Debian/Ubuntu (amd64 / arm64). apt-get resolves Depends and
-                    # runs the postinst (ldconfig + dx_engine wheel into the system python3).
+                    # runs the postinst (ldconfig only). As of release/3.4.0 the postinst no
+                    # longer pip-installs the dx_engine wheel into system python3 -- it only
+                    # stages the per-ABI wheels (cp38..cp314) under
+                    # /usr/share/libdxrt-bin/python and prints manual-install guidance. dx_rt's
+                    # C/C++ runtime (dxrt-cli, libdxrt.so) is fully usable without that step;
+                    # if the Python dx_engine binding is needed, pip-install the wheel whose
+                    # cpXY tag matches the target interpreter from that staged dir.
                     DXRT_DEB="libdxrt-bin_${DXRT_DEB_VERSION}_$(dpkg --print-architecture).deb"
                     echo "Installing dx_rt Debian package from ${ARTIFACT_BASE_URL}/${DXRT_DEB}"
                     fetch "${ARTIFACT_BASE_URL}/${DXRT_DEB}" "${DXRT_DEB}"
