@@ -271,6 +271,10 @@ Resources:
         Manifests:
           - Platform:
               os: "linux"
+              # Match both classic and lite nucleus runtimes. Without this key,
+              # Greengrass Nucleus Lite finds no matching manifest and the
+              # deployment fails immediately on lite core devices.
+              runtime: "*"
             Lifecycle:
               Install:
                 # 2h: dx_stream's installer falls back to compiling OpenCV+GStreamer from
