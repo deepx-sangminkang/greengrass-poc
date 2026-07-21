@@ -276,12 +276,20 @@ Resources:
               # deployment fails immediately on lite core devices.
               runtime: "*"
             Lifecycle:
-              Install:
+              # Lowercase lifecycle keys (install/run/script/timeout) per the
+              # recipe reference: Greengrass Nucleus Lite is case sensitive and
+              # rejects capitalized keys ("no valid lifecycle step"), while the
+              # classic nucleus accepts both.
+              install:
+                # Lite runs components as a non-root user; root is required for
+                # apt-get, DKMS, and firmware flashing (classic runs the script
+                # as root via the default posixUser, so this is a no-op there).
+                requiresPrivilege: true
                 # 2h: dx_stream's installer falls back to compiling OpenCV+GStreamer from
                 # source when apt has no >=4.2 candidate (likely on Ubuntu 26.04),
                 # which alone can take 30-90 min on a low-core aarch64 edge device.
-                Timeout: 7200
-                Script: |
+                timeout: 7200
+                script: |
                   echo "Starting DX-Runtime S3-artifact installation..."
 
                   # Environment required for dxrt-cli / gst-inspect-1.0 (dxstream) to resolve
@@ -406,7 +414,7 @@ Resources:
                     ./build.sh
                     cd "$WORK_DIR"
                   fi
-              Run: "echo \"All DX-Runtime targets have been installed successfully.\""
+              run: "echo \"All DX-Runtime targets have been installed successfully.\""
             Artifacts: []
         Lifecycle: {}
 
