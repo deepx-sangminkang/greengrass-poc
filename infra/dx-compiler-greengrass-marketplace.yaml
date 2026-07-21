@@ -1310,6 +1310,10 @@ Resources:
                 # source when apt has no >=4.2 candidate (likely on Ubuntu 26.04),
                 # which alone can take 30-90 min on a low-core aarch64 edge device.
                 Timeout: 7200
+                # NOTE: no shell brace syntax (curly ${VAR}, function bodies)
+                # anywhere in this script: Nucleus Lite's recipe-runner treats
+                # every "{" as the start of a recipe variable ({kernel:rootPath})
+                # and aborts the install phase on anything else.
                 Script: |
                   echo "Starting DX-Runtime S3-artifact installation..."
 
@@ -1329,10 +1333,10 @@ Resources:
                       *) GST_ARCH_TRIPLET="$(uname -m)-linux-gnu" ;;
                     esac
                   fi
-                  GST_PLUGIN_DIR="/usr/local/lib/${GST_ARCH_TRIPLET}/gstreamer-1.0"
+                  GST_PLUGIN_DIR="/usr/local/lib/$GST_ARCH_TRIPLET/gstreamer-1.0"
 
-                  export GST_PLUGIN_PATH="${GST_PLUGIN_DIR}:$GST_PLUGIN_PATH"
-                  export LD_LIBRARY_PATH="${GST_PLUGIN_DIR}:/usr/local/share/gstdxstream/lib:$LD_LIBRARY_PATH"
+                  export GST_PLUGIN_PATH="$GST_PLUGIN_DIR:$GST_PLUGIN_PATH"
+                  export LD_LIBRARY_PATH="$GST_PLUGIN_DIR:/usr/local/share/gstdxstream/lib:$LD_LIBRARY_PATH"
                   export PATH="/usr/local/share/gstdxstream/bin:/usr/local/bin:$PATH"
 
                   # Public S3 base URL + artifact keys. Downloads use unauthenticated HTTPS, so no
@@ -1366,7 +1370,7 @@ Resources:
                   fi
 
                   if [ "$NEED_DRIVER" -eq 0 ] && [ "$NEED_DXRT" -eq 0 ] && [ "$NEED_FW" -eq 0 ] && [ "$NEED_DXSTREAM" -eq 0 ]; then
-                    echo "All DX-Runtime targets already present (RT Driver ${EXPECTED_RT_DRIVER_VERSION}, dxrt-cli, FW ${EXPECTED_FW_VERSION}, dxstream); skipping download and install."
+                    echo "All DX-Runtime targets already present (RT Driver $EXPECTED_RT_DRIVER_VERSION, dxrt-cli, FW $EXPECTED_FW_VERSION, dxstream); skipping download and install."
                     exit 0
                   fi
 
@@ -1381,7 +1385,7 @@ Resources:
                   WORK_DIR="$(mktemp -d)"
                   cd "$WORK_DIR"
 
-                  fetch() { curl -fSL --retry 3 -o "$2" "$1"; }
+                  fetch() ( curl -fSL --retry 3 -o "$2" "$1" )
 
                   # Build/flash order: dx_rt_npu_linux_driver -> dx_rt -> dx_fw -> dx_stream
 
@@ -1389,12 +1393,12 @@ Resources:
                   # kernel, so pull kernel headers + dkms first (best-effort: the .deb install
                   # surfaces the real error if headers for this exact kernel are unavailable).
                   if [ "$NEED_DRIVER" -eq 0 ]; then
-                    echo "RT Driver already at ${EXPECTED_RT_DRIVER_VERSION}; skipping dx_rt_npu_linux_driver."
+                    echo "RT Driver already at $EXPECTED_RT_DRIVER_VERSION; skipping dx_rt_npu_linux_driver."
                   else
-                    echo "Installing NPU driver from ${ARTIFACT_BASE_URL}/${DRIVER_DEB}"
-                    fetch "${ARTIFACT_BASE_URL}/${DRIVER_DEB}" "${DRIVER_DEB}"
+                    echo "Installing NPU driver from $ARTIFACT_BASE_URL/$DRIVER_DEB"
+                    fetch "$ARTIFACT_BASE_URL/$DRIVER_DEB" "$DRIVER_DEB"
                     sudo apt-get install -y dkms "linux-headers-$(uname -r)" || true
-                    sudo apt-get install -y "./${DRIVER_DEB}"
+                    sudo apt-get install -y "./$DRIVER_DEB"
                   fi
 
                   # 2) dx_rt (staging release/3.4.0, prebuilt Debian binary package libdxrt-bin).
@@ -1410,20 +1414,20 @@ Resources:
                     # C/C++ runtime (dxrt-cli, libdxrt.so) is fully usable without that step;
                     # if the Python dx_engine binding is needed, pip-install the wheel whose
                     # cpXY tag matches the target interpreter from that staged dir.
-                    DXRT_DEB="libdxrt-bin_${DXRT_DEB_VERSION}_$(dpkg --print-architecture).deb"
-                    echo "Installing dx_rt Debian package from ${ARTIFACT_BASE_URL}/${DXRT_DEB}"
-                    fetch "${ARTIFACT_BASE_URL}/${DXRT_DEB}" "${DXRT_DEB}"
-                    sudo apt-get install -y "./${DXRT_DEB}"
+                    DXRT_DEB="libdxrt-bin_$DXRT_DEB_VERSION""_$(dpkg --print-architecture).deb"
+                    echo "Installing dx_rt Debian package from $ARTIFACT_BASE_URL/$DXRT_DEB"
+                    fetch "$ARTIFACT_BASE_URL/$DXRT_DEB" "$DXRT_DEB"
+                    sudo apt-get install -y "./$DXRT_DEB"
                     cd "$WORK_DIR"
                   fi
 
                   # 3) dx_fw (requires dx_rt: flashed via dxrt-cli).
                   if [ "$NEED_FW" -eq 0 ]; then
-                    echo "FW already at ${EXPECTED_FW_VERSION}; skipping dx_fw."
+                    echo "FW already at $EXPECTED_FW_VERSION; skipping dx_fw."
                   else
-                    echo "Flashing firmware from ${ARTIFACT_BASE_URL}/${FW_BIN}"
-                    fetch "${ARTIFACT_BASE_URL}/${FW_BIN}" "${FW_BIN}"
-                    sudo "$DXRT_CLI" -u "${FW_BIN}"
+                    echo "Flashing firmware from $ARTIFACT_BASE_URL/$FW_BIN"
+                    fetch "$ARTIFACT_BASE_URL/$FW_BIN" "$FW_BIN"
+                    sudo "$DXRT_CLI" -u "$FW_BIN"
                   fi
 
                   # 4) dx_stream (staging branch, prebuilt tarball). NOTE: dx_stream install.sh
@@ -1432,10 +1436,10 @@ Resources:
                   if [ "$NEED_DXSTREAM" -eq 0 ]; then
                     echo "dx_stream already installed (dxstream plugin present); skipping."
                   else
-                    echo "Installing dx_stream from ${ARTIFACT_BASE_URL}/${DXSTREAM_TARBALL}"
-                    fetch "${ARTIFACT_BASE_URL}/${DXSTREAM_TARBALL}" "${DXSTREAM_TARBALL}"
+                    echo "Installing dx_stream from $ARTIFACT_BASE_URL/$DXSTREAM_TARBALL"
+                    fetch "$ARTIFACT_BASE_URL/$DXSTREAM_TARBALL" "$DXSTREAM_TARBALL"
                     rm -rf dx_stream
-                    tar xzf "${DXSTREAM_TARBALL}"
+                    tar xzf "$DXSTREAM_TARBALL"
                     cd dx_stream
                     ./install.sh
                     ./build.sh
