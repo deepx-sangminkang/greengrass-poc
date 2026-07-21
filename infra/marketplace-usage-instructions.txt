@@ -1,0 +1,13 @@
+Usage Instructions - DEEPX Greengrass Solution
+
+This product delivers two capabilities from one CloudFormation stack: (1) Compile - turn ONNX models into DEEPX .dxnn files in your account using the DEEPX Compiler AMI (dxcom); (2) Edge deploy - provision AWS IoT Greengrass V2 so the DEEPX NPU runtime (com.deepx.dx-runtime) is installed on your edge core devices.
+
+Prerequisites: an active subscription to this product; a VPC and subnet with outbound internet access (or VPC endpoints for S3, SSM, EC2, Step Functions, CloudWatch Logs); a globally-unique S3 bucket name that does not exist yet (the stack creates and owns the bucket); for edge deploy, one or more AWS IoT Greengrass V2 core devices with DEEPX M1 NPU hardware, outbound HTTPS access, and passwordless sudo for ggc_user (the runtime installs a kernel driver and flashes firmware). DEEPX NPU hardware is sold separately and is not included in this listing.
+
+How to use (self-service):
+1. Subscribe on AWS Marketplace and launch the CloudFormation template. Choose your region and provide VpcId, SubnetId, and ModelBucketName; ImageId resolves automatically from your subscription. Optionally set ThingGroupName to an existing IoT thing group - the stack adopts it instead of failing - or leave it empty to create a stack-unique group.
+2. Compile: upload a model.onnx and its model.json config to the same prefix in the stack's S3 bucket, one model pair per prefix (e.g. models/resnet/resnet.onnx + models/resnet/resnet.json). A temporary compiler instance launches automatically, and the .dxnn appears in the same prefix when compilation finishes. Track progress in Step Functions / CloudWatch Logs.
+3. Edge deploy: install Greengrass Core on your DEEPX NPU devices using the stack outputs - join them to the thing group (ThingGroupName output) and pass the token exchange role (TokenExchangeRoleName output) to the Greengrass installer. Devices in the group receive com.deepx.dx-runtime automatically and install the NPU driver, firmware, dx_rt, and dx_stream over-the-air. Installation is idempotent, so redeployments skip up-to-date devices.
+4. Deliver the compiled .dxnn to the edge device and run it on the NPU.
+
+No step requires seller approval; deployment and usage are fully self-service. Full account-level disclosure (resources created, IAM scope, external dependencies) is provided in the product documentation.
