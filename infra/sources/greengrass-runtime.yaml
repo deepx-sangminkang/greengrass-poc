@@ -20,24 +20,17 @@ Parameters:
       coexist in the same account.
   DxRuntimeComponentVersion:
     Type: String
-    Default: "2.3.0"
+    Default: "2.4.0"
     Description: Existing published version of the com.deepx.dx-runtime component to deploy.
   DxRuntimeArtifactBaseUrl:
     Type: String
-    Default: "https://deepx-public-bucket.s3.ap-northeast-2.amazonaws.com/dx-runtime"
+    Default: "https://deepx-public-bucket.s3.ap-northeast-2.amazonaws.com/dx-runtime/v2.4.0"
     Description: >-
       Public S3 base URL for the DX-Runtime install artifacts the component
-      downloads at deploy time: dxrt-driver-dkms_2.5.1-2_all.deb (NPU driver),
-      libdxrt-bin_3.4.0_{amd64,arm64}.deb (dx_rt prebuilt Debian package), fw.bin, and
-      dx_stream.tar.gz (dx_stream staging).
-  CliComponentVersion:
-    Type: String
-    Default: "2.17.0"
-    Description: >-
-      Concrete version of the AWS-managed aws.greengrass.Cli component to deploy.
-      The Cli version tracks the Greengrass nucleus version, so set this to match
-      the nucleus running on the core devices (nucleus 2.17.x -> Cli 2.17.0).
-      Enables the greengrass-cli local development tool on each core device.
+      downloads at deploy time. The vX.Y.Z prefix is an immutable bundle matching
+      the component version: dxrt-driver-dkms_2.5.1-2_all.deb (NPU driver),
+      libdxrt-bin_3.4.0_{amd64,arm64}.deb (dx_rt prebuilt Debian package),
+      fw.bin (2.7.2), and dx_stream.tar.gz (dx_stream staging v3.1.0).
 
 Conditions:
   HasThingGroupName: !Not [!Equals [!Ref ThingGroupName, ""]]
@@ -322,7 +315,7 @@ Resources:
                   # already present" rather than a version match.
                   DXRT_CLI="/usr/local/bin/dxrt-cli"
                   EXPECTED_RT_DRIVER_VERSION="v2.5.1"
-                  EXPECTED_FW_VERSION="v2.7.1"
+                  EXPECTED_FW_VERSION="v2.7.2"
 
                   DXRT_STATUS=""
                   if [ -x "$DXRT_CLI" ]; then
@@ -423,8 +416,6 @@ Resources:
       Components:
         com.deepx.dx-runtime:
           ComponentVersion: !Ref DxRuntimeComponentVersion
-        aws.greengrass.Cli:
-          ComponentVersion: !Ref CliComponentVersion
 
 Outputs:
   ProjectName:

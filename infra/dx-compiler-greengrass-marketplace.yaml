@@ -9,7 +9,7 @@ Description: >-
   runtime deployment.
 
 Metadata:
-  Version: 2.3.0
+  Version: 2.4.0
   Source: marketplace
   AWS::CloudFormation::Interface:
     ParameterGroups:
@@ -98,27 +98,22 @@ Parameters:
     Description: >-
       AWS IoT thing group that Greengrass core devices join. Leave empty to
       derive a stack-unique name (<stack-name>-cores) so multiple stacks can
-      coexist in the same account.
+      coexist in the same account. If the named group already exists it is
+      adopted as-is and the DX Runtime deployment targets it (the stack does
+      not fail on a duplicate, and does not delete an adopted group).
   DxRuntimeComponentVersion:
     Type: String
-    Default: "2.3.0"
+    Default: "2.4.0"
     Description: Existing published version of the com.deepx.dx-runtime component to deploy.
   DxRuntimeArtifactBaseUrl:
     Type: String
-    Default: "https://deepx-public-bucket.s3.ap-northeast-2.amazonaws.com/dx-runtime"
+    Default: "https://deepx-public-bucket.s3.ap-northeast-2.amazonaws.com/dx-runtime/v2.4.0"
     Description: >-
       Public S3 base URL for the DX-Runtime install artifacts the component
-      downloads at deploy time: dxrt-driver-dkms_2.5.1-2_all.deb (NPU driver),
-      libdxrt-bin_3.4.0_{amd64,arm64}.deb (dx_rt prebuilt Debian package), fw.bin, and
-      dx_stream.tar.gz (dx_stream staging).
-  CliComponentVersion:
-    Type: String
-    Default: "2.17.0"
-    Description: >-
-      Concrete version of the AWS-managed aws.greengrass.Cli component to deploy.
-      The Cli version tracks the Greengrass nucleus version, so set this to match
-      the nucleus running on the core devices (nucleus 2.17.x -> Cli 2.17.0).
-      Enables the greengrass-cli local development tool on each core device.
+      downloads at deploy time. The vX.Y.Z prefix is an immutable bundle matching
+      the component version: dxrt-driver-dkms_2.5.1-2_all.deb (NPU driver),
+      libdxrt-bin_3.4.0_{amd64,arm64}.deb (dx_rt prebuilt Debian package),
+      fw.bin (2.7.2), and dx_stream.tar.gz (dx_stream staging v3.1.0).
 
 Conditions:
   HasThingGroupName: !Not [!Equals [!Ref ThingGroupName, ""]]
@@ -925,9 +920,145 @@ Resources:
         - !Ref EC2InstanceRole
 
   # ===== Greengrass: deploy the DEEPX NPU runtime to edge core devices =====
-  GreengrassThingGroup:
-    Type: AWS::IoT::ThingGroup
+  ThingGroupFunctionRole:
+    Type: AWS::IAM::Role
     Properties:
+      Description: Execution role for the idempotent IoT thing group provisioner Lambda.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ThingGroupProvisionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ThingGroupLogging
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Sid: ThingGroupProvision
+                Effect: Allow
+                Action:
+                  - iot:CreateThingGroup
+                  - iot:DescribeThingGroup
+                  - iot:DeleteThingGroup
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:thinggroup/${GroupName}"
+                  - GroupName: !If
+                      - HasThingGroupName
+                      - !Ref ThingGroupName
+                      - !Sub "${AWS::StackName}-cores"
+
+  ThingGroupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: >-
+        Idempotently provisions the IoT thing group. Adopts a pre-existing group
+        (shared) instead of failing on a duplicate name; only groups this stack
+        created (owned) are deleted with the stack.
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt ThingGroupFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          iot = boto3.client("iot")
+
+
+          def _send(event, context, status, data=None, physical_id=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": "See CloudWatch Logs: %s" % context.log_stream_name,
+                  "PhysicalResourceId": physical_id or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {},
+              }).encode("utf-8")
+              request = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=body,
+                  method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))},
+              )
+              urllib.request.urlopen(request)
+
+
+          def _adopt_or_create(name):
+              """Return (arn, marker). Describe-first so ownership is deterministic:
+              a group that already exists is adopted as ":shared" and never deleted
+              by this stack; only a group this call creates is ":owned"."""
+              try:
+                  arn = iot.describe_thing_group(thingGroupName=name)["thingGroupArn"]
+                  print("[thinggroup] adopting existing group %s" % name)
+                  return arn, "shared"
+              except ClientError as error:
+                  if error.response["Error"]["Code"] != "ResourceNotFoundException":
+                      raise
+              arn = iot.create_thing_group(thingGroupName=name)["thingGroupArn"]
+              print("[thinggroup] created group %s" % name)
+              return arn, "owned"
+
+
+          def handler(event, context):
+              props = event.get("ResourceProperties", {})
+              name = props.get("ThingGroupName", "unknown")
+              try:
+                  request_type = event["RequestType"]
+
+                  if request_type == "Delete":
+                      pid = event.get("PhysicalResourceId", name)
+                      if pid.endswith(":owned"):
+                          try:
+                              iot.delete_thing_group(thingGroupName=name)
+                              print("[thinggroup] deleted %s" % name)
+                          except ClientError as error:
+                              # Best-effort: never block stack deletion on group cleanup.
+                              print("[thinggroup] delete skipped for %s: %s" % (name, error))
+                      else:
+                          print("[thinggroup] %s not owned by this stack, keeping" % name)
+                      _send(event, context, "SUCCESS", physical_id=pid)
+                      return
+
+                  if request_type == "Update":
+                      pid = event.get("PhysicalResourceId", name)
+                      old_name = pid.rsplit(":", 1)[0]
+                      if old_name == name:
+                          # Same group: keep the create-time ownership marker so
+                          # CloudFormation does not issue a Delete for the live group.
+                          arn, _ = _adopt_or_create(name)
+                          _send(event, context, "SUCCESS",
+                                {"Arn": arn, "ThingGroupName": name}, pid)
+                          return
+                      # Name changed: fall through and provision the new group.
+                      # CloudFormation then calls Delete on the old PhysicalResourceId.
+
+                  arn, marker = _adopt_or_create(name)
+                  _send(event, context, "SUCCESS",
+                        {"Arn": arn, "ThingGroupName": name},
+                        "%s:%s" % (name, marker))
+              except Exception as error:  # noqa: BLE001
+                  print("[thinggroup] error: %s" % error)
+                  _send(event, context, "FAILED", {"Message": str(error)},
+                        event.get("PhysicalResourceId", name))
+
+  GreengrassThingGroup:
+    Type: Custom::ThingGroup
+    Properties:
+      ServiceToken: !GetAtt ThingGroupFunction.Arn
       ThingGroupName: !If
         - HasThingGroupName
         - !Ref ThingGroupName
@@ -1204,7 +1335,7 @@ Resources:
                   # already present" rather than a version match.
                   DXRT_CLI="/usr/local/bin/dxrt-cli"
                   EXPECTED_RT_DRIVER_VERSION="v2.5.1"
-                  EXPECTED_FW_VERSION="v2.7.1"
+                  EXPECTED_FW_VERSION="v2.7.2"
 
                   DXRT_STATUS=""
                   if [ -x "$DXRT_CLI" ]; then
@@ -1311,8 +1442,6 @@ Resources:
       Components:
         com.deepx.dx-runtime:
           ComponentVersion: !Ref DxRuntimeComponentVersion
-        aws.greengrass.Cli:
-          ComponentVersion: !Ref CliComponentVersion
 
 Outputs:
   ModelBucketName:
@@ -1330,7 +1459,7 @@ Outputs:
   WorkflowInstructions:
     Description: Instructions for using the DX Compiler automation.
     Value: !Sub |
-      DX COMPILER AUTOMATION - AWS MARKETPLACE EDITION (v2.3.0)
+      DX COMPILER AUTOMATION - AWS MARKETPLACE EDITION (v2.4.0)
 
       USAGE:
       1. Upload .onnx model and .json config file pairs to the same directory in: s3://${ModelBucket}/
@@ -1352,7 +1481,7 @@ Outputs:
     Value: !Ref ProjectName
   ThingGroupName:
     Description: AWS IoT thing group for Greengrass core devices.
-    Value: !Ref GreengrassThingGroup
+    Value: !GetAtt GreengrassThingGroup.ThingGroupName
   TokenExchangeRoleName:
     Description: Token exchange role name passed to the Greengrass installer.
     Value: !Ref GreengrassTokenExchangeRole
