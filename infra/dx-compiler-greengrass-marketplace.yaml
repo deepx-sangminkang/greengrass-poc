@@ -90,7 +90,7 @@ Parameters:
     ConstraintDescription: Must be an existing subnet ID in the selected VPC.
   ProjectName:
     Type: String
-    Default: dx-runtime-greengrass-web
+    Default: dx-greengrass
     Description: Logical project name surfaced through stack outputs.
   ThingGroupName:
     Type: String

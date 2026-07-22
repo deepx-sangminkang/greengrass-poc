@@ -9,7 +9,7 @@ Description: >-
 Parameters:
   ProjectName:
     Type: String
-    Default: dx-runtime-greengrass-web
+    Default: dx-greengrass
     Description: Logical project name surfaced through stack outputs.
   ThingGroupName:
     Type: String
