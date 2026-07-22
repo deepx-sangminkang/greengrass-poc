@@ -1346,37 +1346,13 @@ Resources:
                   DXRT_DEB_VERSION="3.4.0"
                   FW_BIN="fw.bin"
                   DXSTREAM_TARBALL="dx_stream.tar.gz"
-
-                  # Pinned artifact versions used for the idempotency skip check. driver/fw are
-                  # fixed releases; dx_rt (Debian pkg) and dx_stream skip on "binary/plugin
-                  # already present" rather than a version match.
                   DXRT_CLI="/usr/local/bin/dxrt-cli"
-                  EXPECTED_RT_DRIVER_VERSION="v2.5.1"
-                  EXPECTED_FW_VERSION="v2.7.2"
 
-                  DXRT_STATUS=""
-                  if [ -x "$DXRT_CLI" ]; then
-                    DXRT_STATUS="$("$DXRT_CLI" -s 2>/dev/null || true)"
-                  fi
-                  CURRENT_RT_DRIVER_VERSION="$(printf '%s\n' "$DXRT_STATUS" | grep -E 'RT Driver version' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
-                  CURRENT_FW_VERSION="$(printf '%s\n' "$DXRT_STATUS" | grep -E 'FW version' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
-
-                  NEED_DRIVER=1; [ "$CURRENT_RT_DRIVER_VERSION" = "$EXPECTED_RT_DRIVER_VERSION" ] && NEED_DRIVER=0
-                  NEED_DXRT=1; [ -x "$DXRT_CLI" ] && NEED_DXRT=0
-                  NEED_FW=1; [ "$CURRENT_FW_VERSION" = "$EXPECTED_FW_VERSION" ] && NEED_FW=0
-                  NEED_DXSTREAM=1
-                  if command -v gst-inspect-1.0 >/dev/null 2>&1 && gst-inspect-1.0 dxstream >/dev/null 2>&1; then
-                    NEED_DXSTREAM=0
-                  fi
-
-                  if [ "$NEED_DRIVER" -eq 0 ] && [ "$NEED_DXRT" -eq 0 ] && [ "$NEED_FW" -eq 0 ] && [ "$NEED_DXSTREAM" -eq 0 ]; then
-                    echo "All DX-Runtime targets already present (RT Driver $EXPECTED_RT_DRIVER_VERSION, dxrt-cli, FW $EXPECTED_FW_VERSION, dxstream); skipping download and install."
-                    exit 0
-                  fi
-
-                  # Fail hard from here on so a broken install marks the component BROKEN rather
-                  # than silently continuing. (Kept out of the detection block above, where empty
-                  # grep matches are expected and must not abort.)
+                  # Every deployment reinstalls all four targets unconditionally (no
+                  # version/presence skip checks): --reinstall forces apt to reinstall
+                  # same-version .debs instead of reporting "already newest".
+                  # Fail hard so a broken install marks the component BROKEN rather
+                  # than silently continuing.
                   set -e
 
                   sudo apt-get update
@@ -1392,59 +1368,43 @@ Resources:
                   # 1) NPU Linux driver (DKMS .deb). DKMS builds the module against the running
                   # kernel, so pull kernel headers + dkms first (best-effort: the .deb install
                   # surfaces the real error if headers for this exact kernel are unavailable).
-                  if [ "$NEED_DRIVER" -eq 0 ]; then
-                    echo "RT Driver already at $EXPECTED_RT_DRIVER_VERSION; skipping dx_rt_npu_linux_driver."
-                  else
-                    echo "Installing NPU driver from $ARTIFACT_BASE_URL/$DRIVER_DEB"
-                    fetch "$ARTIFACT_BASE_URL/$DRIVER_DEB" "$DRIVER_DEB"
-                    sudo apt-get install -y dkms "linux-headers-$(uname -r)" || true
-                    sudo apt-get install -y "./$DRIVER_DEB"
-                  fi
+                  echo "Installing NPU driver from $ARTIFACT_BASE_URL/$DRIVER_DEB"
+                  fetch "$ARTIFACT_BASE_URL/$DRIVER_DEB" "$DRIVER_DEB"
+                  sudo apt-get install -y dkms "linux-headers-$(uname -r)" || true
+                  sudo apt-get install -y --reinstall "./$DRIVER_DEB"
 
                   # 2) dx_rt (staging release/3.4.0, prebuilt Debian binary package libdxrt-bin).
-                  if [ "$NEED_DXRT" -eq 0 ]; then
-                    echo "dx_rt already installed (dxrt-cli present); skipping."
-                  else
-                    # Arch-specific prebuilt package: dpkg's arch name matches the .deb suffix
-                    # exactly on Debian/Ubuntu (amd64 / arm64). apt-get resolves Depends and
-                    # runs the postinst (ldconfig only). As of release/3.4.0 the postinst no
-                    # longer pip-installs the dx_engine wheel into system python3 -- it only
-                    # stages the per-ABI wheels (cp38..cp314) under
-                    # /usr/share/libdxrt-bin/python and prints manual-install guidance. dx_rt's
-                    # C/C++ runtime (dxrt-cli, libdxrt.so) is fully usable without that step;
-                    # if the Python dx_engine binding is needed, pip-install the wheel whose
-                    # cpXY tag matches the target interpreter from that staged dir.
-                    DXRT_DEB="libdxrt-bin_$DXRT_DEB_VERSION""_$(dpkg --print-architecture).deb"
-                    echo "Installing dx_rt Debian package from $ARTIFACT_BASE_URL/$DXRT_DEB"
-                    fetch "$ARTIFACT_BASE_URL/$DXRT_DEB" "$DXRT_DEB"
-                    sudo apt-get install -y "./$DXRT_DEB"
-                    cd "$WORK_DIR"
-                  fi
+                  # Arch-specific prebuilt package: dpkg's arch name matches the .deb suffix
+                  # exactly on Debian/Ubuntu (amd64 / arm64). apt-get resolves Depends and
+                  # runs the postinst (ldconfig only). As of release/3.4.0 the postinst no
+                  # longer pip-installs the dx_engine wheel into system python3 -- it only
+                  # stages the per-ABI wheels (cp38..cp314) under
+                  # /usr/share/libdxrt-bin/python and prints manual-install guidance. dx_rt's
+                  # C/C++ runtime (dxrt-cli, libdxrt.so) is fully usable without that step;
+                  # if the Python dx_engine binding is needed, pip-install the wheel whose
+                  # cpXY tag matches the target interpreter from that staged dir.
+                  DXRT_DEB="libdxrt-bin_$DXRT_DEB_VERSION""_$(dpkg --print-architecture).deb"
+                  echo "Installing dx_rt Debian package from $ARTIFACT_BASE_URL/$DXRT_DEB"
+                  fetch "$ARTIFACT_BASE_URL/$DXRT_DEB" "$DXRT_DEB"
+                  sudo apt-get install -y --reinstall "./$DXRT_DEB"
+                  cd "$WORK_DIR"
 
                   # 3) dx_fw (requires dx_rt: flashed via dxrt-cli).
-                  if [ "$NEED_FW" -eq 0 ]; then
-                    echo "FW already at $EXPECTED_FW_VERSION; skipping dx_fw."
-                  else
-                    echo "Flashing firmware from $ARTIFACT_BASE_URL/$FW_BIN"
-                    fetch "$ARTIFACT_BASE_URL/$FW_BIN" "$FW_BIN"
-                    sudo "$DXRT_CLI" -u "$FW_BIN"
-                  fi
+                  echo "Flashing firmware from $ARTIFACT_BASE_URL/$FW_BIN"
+                  fetch "$ARTIFACT_BASE_URL/$FW_BIN" "$FW_BIN"
+                  sudo "$DXRT_CLI" -u "$FW_BIN"
 
                   # 4) dx_stream (staging branch, prebuilt tarball). NOTE: dx_stream install.sh
                   # installs every dependency by default and has NO --all flag -- it hard-errors
                   # (exit 1) on unknown arguments -- so it must be invoked with no arguments.
-                  if [ "$NEED_DXSTREAM" -eq 0 ]; then
-                    echo "dx_stream already installed (dxstream plugin present); skipping."
-                  else
-                    echo "Installing dx_stream from $ARTIFACT_BASE_URL/$DXSTREAM_TARBALL"
-                    fetch "$ARTIFACT_BASE_URL/$DXSTREAM_TARBALL" "$DXSTREAM_TARBALL"
-                    rm -rf dx_stream
-                    tar xzf "$DXSTREAM_TARBALL"
-                    cd dx_stream
-                    ./install.sh
-                    ./build.sh
-                    cd "$WORK_DIR"
-                  fi
+                  echo "Installing dx_stream from $ARTIFACT_BASE_URL/$DXSTREAM_TARBALL"
+                  fetch "$ARTIFACT_BASE_URL/$DXSTREAM_TARBALL" "$DXSTREAM_TARBALL"
+                  rm -rf dx_stream
+                  tar xzf "$DXSTREAM_TARBALL"
+                  cd dx_stream
+                  ./install.sh
+                  ./build.sh
+                  cd "$WORK_DIR"
               run: "echo \"All DX-Runtime targets have been installed successfully.\""
             Artifacts: []
         Lifecycle: {}
