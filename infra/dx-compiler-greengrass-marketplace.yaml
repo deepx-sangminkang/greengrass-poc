@@ -113,7 +113,7 @@ Parameters:
       downloads at deploy time. The vX.Y.Z prefix is an immutable bundle matching
       the component version: dxrt-driver-dkms_2.5.1-2_all.deb (NPU driver),
       libdxrt-bin_3.4.0_{amd64,arm64}.deb (dx_rt prebuilt Debian package),
-      fw.bin (2.7.2), and dx_stream.tar.gz (dx_stream staging v3.1.0).
+      fw.bin (2.7.3), and dx_stream.tar.gz (dx_stream staging v3.1.0).
 
 Conditions:
   HasThingGroupName: !Not [!Equals [!Ref ThingGroupName, ""]]
