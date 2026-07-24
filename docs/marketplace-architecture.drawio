@@ -94,6 +94,9 @@
         <mxCell id="r6" value="Thing Group Lambda&#10;Role" style="sketch=0;outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#DD344C;strokeColor=none;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=11;fontStyle=0;aspect=fixed;pointerEvents=1;shape=mxgraph.aws4.role;" vertex="1" parent="iam">
           <mxGeometry x="1105" y="60" width="78" height="44" as="geometry" />
         </mxCell>
+        <mxCell id="note" value="Note: this template creates no load balancer and no VPC. Compiler instances launch into an existing customer VPC/subnet supplied via the VpcId / SubnetId parameters." style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=2;fontColor=#5A6B75;whiteSpace=wrap;" vertex="1" parent="cloud">
+          <mxGeometry x="40" y="1095" width="1300" height="36" as="geometry" />
+        </mxCell>
         <mxCell id="e1" value="1. Upload .onnx + .json" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#4CAF50;strokeWidth=2;fontSize=12;" edge="1" parent="1" source="user" target="s3">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
